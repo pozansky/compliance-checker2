@@ -21,7 +21,6 @@ from langchain_core.output_parsers import StrOutputParser
 from langchain_core.documents import Document
 
 # 设置 DashScope API Key
-os.environ["DASHSCOPE_API_KEY"] = "sk-eb015732b43844a7980f0daf9eba556d"
 
 class ComplianceRAGEngine:
     def __init__(self):
