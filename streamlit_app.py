@@ -30,8 +30,8 @@ def _normalize_product_type(pt_label: str) -> Optional[str]:
 def main() -> None:
     st.set_page_config(page_title="合规检测系统", page_icon="🔍", layout="wide")
 
-    st.title("🔍 合规检测系统（统一使用 src/rag_engine.py）")
-    st.caption("此页面只负责界面展示，所有规则与判断逻辑都在 `src/rag_engine.py` 维护。")
+    st.title("🔍 合规检测系统（统一使用 rag_engine.py）")
+    st.caption("此页面只负责界面展示，所有规则与判断逻辑都在 `rag_engine.py` 维护。")
 
     with st.sidebar:
         st.header("配置")

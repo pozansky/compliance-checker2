@@ -1,0 +1,38 @@
+# Core requirements
+python>=3.10
+
+# HTTP requests and API
+requests
+urllib3
+
+# Cryptography and security
+cryptography
+pycryptodome
+
+# Data processing and analysis
+pandas
+numpy
+
+# AI and LLM
+langchain
+langchain-openai
+langchain-community
+langchain-core
+openai
+dashscope
+
+# Embeddings and vector stores
+faiss-cpu
+sentence-transformers
+
+# Logging and configuration
+PyYAML
+
+# Progress bars and UI
+tqdm
+
+# Concurrency and threading
+concurrent-log-handler
+
+# Utilities
+python-dateutil
