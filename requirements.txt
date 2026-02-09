@@ -6,5 +6,10 @@ qwen
 sentence-transformers
 faiss-cpu
 streamlit
-pydantic>=2.0
+pydantic
 langchain_huggingface
+langchain-openai
+openai
+python-dotenv
+sentence-transformers
+pypdf
