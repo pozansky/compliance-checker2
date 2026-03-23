@@ -1,7 +1,11 @@
 import os
 import re
+import json
+import math
 from typing import Dict, Any, List, Tuple
 import warnings
+import logging
+import httpx
 
 # 关闭所有 LangChain 相关警告
 warnings.filterwarnings("ignore", category=UserWarning)
@@ -20,115 +24,1080 @@ from langchain_core.runnables import RunnablePassthrough, RunnableLambda
 from langchain_core.output_parsers import StrOutputParser
 from langchain_core.documents import Document
 
-# 设置 DashScope API Key
+logger = logging.getLogger(__name__)
+
 
 class ComplianceRAGEngine:
-    def __init__(self):
+    NEGATION_TERMS: Tuple[str, ...] = ("不能", "不要", "别", "不得", "禁止", "不可", "严禁")
+    # 按产品类型生效的事件：事件名称 -> 仅在对应 product_type 时保留（"1.0"/"2.0"/"3.0"）
+    PRODUCT_TYPE_GATED_EVENTS: Dict[str, str] = {
+        "虚假宣传案例精选及人工推票": "1.0",
+        "冒用沈杨老师名义": "2.0",
+        "对投研调研活动夸大宣传": "3.0",
+        "夸大宣传策略重仓操作": "3.0",
+    }
+    # 规则 ID -> 规则名称（与 prompt 白名单、product_type 过滤共用）
+    RULE_NAMES: Dict[int, str] = {
+        1: "直接承诺收益",
+        2: "突出客户盈利反馈",
+        3: "突出描述个股涨幅绩效",
+        4: "对投研调研活动夸大宣传",
+        5: "向客户索要手机号",
+        6: "使用敏感词汇",
+        7: "异常开户",
+        8: "干扰风险测评独立性",
+        9: "错误表述服务合同生效起始周期",
+        10: "不文明用语",
+        11: "以退款为营销卖点",
+        12: "怂恿客户使用他人身份办理服务",
+        13: "违规指导",
+        14: "将具体股票策略接入权限作为即时办理卖点",
+        15: "虚假宣传案例精选及人工推票",
+        16: "冒用沈杨老师名义",
+        17: "收受客户礼品",
+        18: "夸大宣传策略重仓操作",
+        19: "虚假宣传",
+        20: "变相承诺收益",
+    }
+
+    def __init__(
+        self,
+        retrieve_k: int = None,
+        retrieve_score_threshold: float = None,
+        max_rules: int = None,
+        chunk_size: int = None,
+        chunk_overlap: int = None,
+    ):
+        # 检索与分块参数（可由调用方传入或从环境变量读取，便于调参）
+        def _int_env(name: str, default: int) -> int:
+            v = os.getenv(name)
+            return int(v) if v is not None and v.strip() != "" else default
+
+        def _float_env(name: str, default: float) -> float:
+            v = os.getenv(name)
+            return float(v) if v is not None and v.strip() != "" else default
+
+        self._retrieve_k = retrieve_k if retrieve_k is not None else _int_env("RAG_RETRIEVE_K", 20)
+        self._retrieve_score_threshold = (
+            retrieve_score_threshold
+            if retrieve_score_threshold is not None
+            else _float_env("RAG_RETRIEVE_SCORE_THRESHOLD", 0.35)
+        )
+        self._max_rules = max_rules if max_rules is not None else _int_env("RAG_MAX_RULES", 6)
+        self._chunk_size = chunk_size if chunk_size is not None else _int_env("RAG_CHUNK_SIZE", 600)
+        self._chunk_overlap = chunk_overlap if chunk_overlap is not None else _int_env("RAG_CHUNK_OVERLAP", 200)
+
+        # 最近一次 LLM 请求的 request_id（便于日志追踪）
+        self._last_request_id: str | None = None
+        self._rule_name_to_id: Dict[str, int] = {v: k for k, v in self.RULE_NAMES.items()}
+
         # 1. 初始化嵌入模型 (使用本地模型确保语义匹配精度)
         self.embeddings = HuggingFaceEmbeddings(
             model_name="sentence-transformers/paraphrase-multilingual-MiniLM-L12-v2"
         )
-        
-        # 2. 构建向量库（使用分块策略提高召回率）
+
+        # 2. 构建规则向量库（使用分块策略提高召回率）
         self._initialize_vector_store()
 
+        # 2.1 构建 good/bad case 向量库（从 src/cases/*.md 读取）
+        self._initialize_case_store()
+
         # 3. 初始化 LLM (保持原有参数以确保确定性)
+        # 为了记录 DashScope 的 request_id，这里通过 httpx 客户端拦截底层 HTTP 响应头。
+
+        def _dashscope_response_hook(response: httpx.Response) -> None:
+            try:
+                rid = (
+                    response.headers.get("x-request-id")
+                    or response.headers.get("X-Request-Id")
+                    or response.headers.get("request-id")
+                )
+                if rid:
+                    # 直接打到 processing.log（根 logger 会接管），方便排查
+                    logger.info(f"DashScope HTTP 响应 request_id={rid}")
+            except Exception:
+                # 不因日志问题影响主流程
+                pass
+
+        # 固定使用你提供的 DashScope key，保证与语音转写一致
+        os.environ["DASHSCOPE_API_KEY"] = "sk-eb015732b43844a7980f0daf9eba556d"
+
+        self._http_client = httpx.Client(event_hooks={"response": [_dashscope_response_hook]})
+
         self.llm = ChatOpenAI(
-            model="qwen-plus",
-            # model="deepseek-v3.2",
-            openai_api_key=os.getenv("DASHSCOPE_API_KEY"), 
+            model="qwen3.5-plus",
+            openai_api_key=os.getenv("DASHSCOPE_API_KEY"),
             openai_api_base="https://dashscope.aliyuncs.com/compatible-mode/v1",
             temperature=0.0,
             max_tokens=800,
             top_p=1.0,
             seed=42,
-            max_retries=0,
+            max_retries=2,
+            request_timeout=60,
+            http_client=self._http_client,
+            # 千问思考模式：须通过 extra_body 传入，否则会报 Completions.create() unexpected keyword 'enable_thinking'
+            extra_body={"enable_thinking": False},
         )
 
-        # 4. 定义 RAG 专用 Prompt（完全保持原样）
-        prompt = ChatPromptTemplate.from_template("""
-你是一个违规风险检测员，你的任务是帮我判断用户的文本是否有违规项。
+        # 4. 定义 RAG 专用 Prompt（评分版：规则细节在 rules.md → {context}，此处只保留角色、约束、阈值、输出格式）
+        _prompt_raw = """
+你是证券投顾场景的【合规风险评分引擎】。根据下方【规则背景】中的候选规则做加减分，得到 0–100 的 risk_score，并输出 decision（violation/review/compliant）与 confidence。
 
-## 【反漏判总则：深度分析与强制核查】
-你必须按照此顺序思考：
-1. **信号扫描**：标记出所有涉及规则的"嫌疑点"。
-2. **逐条对照**：携带嫌疑点去对照下方检索到的具体规则判定条件。
-3. **排除法验证**：使用对应规则的"绝对排除条款"进行验证。
-4. **汇总决策**：映射到对应的规则。
+【必须遵守】
+1. 必须基于规则中的明确文字证据，不得因“整体感觉”直接判 violation。
+2. 同一文本可同时含多种风险因子与保护因子，须综合加减分，不得“命中一句就违规”。
+3. 保护因子（风险提示、历史说明、免责声明等）命中时须减分。
 
----
+【判定原则（最高优先级）】
+- 以短句为单位分析，严禁跨句组合解读；一个“保证”只对其所在短句负责；“保证”后接服务/价格/流程/一致性等非收益内容时，该句合规。
+- 诱导、暗示、营销话术（如“信我”“好吗？”“可以吗？”）不单独判违规；未出现“保证/一定/肯定”+具体金钱收益的死线结构时，不判违规。
+- 严格字面匹配：规则中写明的“绝对排除”“一律合规”情形必须执行；禁止联想、加戏、过度解读。
 
-## 违规规则详情（检索到的相关条款）：
+【规则背景】以下为与待检测文本相关的候选规则（每条均为加减分制，分值以规则内为准）：
+
 {context}
 
----
+【bad/good 示例】仅作类比参考，结合当前文本独立判断：
 
-## 重要注意事项：
-注意，所有的诱导和暗示视为不违规！！！！！
-注意，所有的诱导和暗示视为不违规！！！！！
+{cases_context}
 
-以上规则单独判断！！！！！！
-以上规则单独判断！！！！！！
+【事件名称白名单】rule_name 只能从下列中选择：
 
-## 【终极输出指令】
+__EVENT_WHITELIST__
 
-**你必须做出最终判断，并且只输出以下三行内容，绝对不要输出多余的解释！**
+【决策阈值】risk_score 决定 decision（与系统一致）：
+- risk_score ≥ 30 → "violation"；15 ≤ risk_score < 30 → "review"；risk_score < 15 → "compliant"。
+confidence：证据清晰 0.8~1.0，有模糊或保护较多 0.5~0.8，仅低风险或模糊 0.0~0.5。
 
-**注意：如果触发多个事件，请在“理由”行中按 [事件名称]:理由 的格式分别列出，用分号“;”隔开。**
+【输出格式】仅输出一个 JSON 对象，字段（大小写一致）：
+- risk_score：0–100 数值
+- decision："violation"|"review"|"compliant"
+- confidence：0–1
+- risk_factors：[{{ "rule_id", "rule_name"（来自白名单）, "level":"high"|"medium"|"low", "weight"（正数）, "sentence" }}]
+- protective_factors：[{{ "rule_id"（可选）, "rule_name"（可选）, "weight"（负数）, "sentence" }}]
+- summary_reason：简洁中文说明
+要求：仅此 JSON，无多余文字；无明显风险时 risk_score≈0、decision="compliant"。
 
-**注意：触发事件只能从以下18个名称中选择：**
-直接承诺收益、突出客户盈利反馈、突出描述个股涨幅绩效、对投研调研活动夸大宣传、
-向客户索要手机号、使用敏感词汇、异常开户、干扰风险测评独立性、
-错误表述服务合同生效起始周期、不文明用语、以退款为营销卖点、
-怂恿客户使用他人身份办理服务、违规指导、将具体股票策略接入权限作为即时办理卖点、虚假宣传案例精选及人工推票、
-冒用沈杨老师名义、收受客户礼品、夸大宣传策略重仓操作
+【规则13一致性约束（仅限“违规指导”）】
+- 如果你在 summary_reason 中明确写出“构成违规指导”“符合规则13”“属于规则13高风险”等结论，则 risk_factors 必须包含 rule_id=13 / rule_name="违规指导"，且 decision 不能为 "compliant"。
+- 如果你判断“不构成违规指导”“不符合规则13”“属于服务介绍/功能教学/状态确认/风险提醒”等非违规场景，则 risk_factors 中不得包含 rule_id=13 / rule_name="违规指导"，且 summary_reason 不得再写“构成违规指导”“符合规则13”之类相反结论。
+- 严禁出现：summary_reason 说“构成违规指导”，但 risk_factors/decision 却显示未触发；或 summary_reason 说“不构成违规指导”，但 risk_factors 却仍包含“违规指导”。
 
-**示例输出（多个违规）：**
-是否违规：是
-触发事件：直接承诺收益,不文明用语
-理由：[直接承诺收益]:文中包含"保证赚钱"；[不文明用语]:文中包含"去死吧你"
+【待检测内容】
 
-**示例输出（单个违规）：**
-是否违规：是
-触发事件：直接承诺收益
-理由：[直接承诺收益]:文中包含"保证赚钱"的确定性承诺
-
-**示例输出（合规）：**
-是否违规：否 
-触发事件：无
-理由：所有表述均为合规描述
-
----
-**待检测聊天内容：**  
 {input}
----
 
-**【最后一道指令 - 严格执行】**
-**请现在开始判断。**
-**重要警告：直接给出最终的三行结果（是否违规、触发事件、理由）。**
-**重要：如果判定为多个违规，理由必须按照 [事件名称]:理由; 的格式逐一列出！**
-""")
+请依据【规则背景】与上述格式，只输出一个 JSON 对象。
+"""
+        _event_whitelist = "\n".join(f"{i}. {self.RULE_NAMES[i]}、" for i in range(1, 21)).rstrip("、")
+        prompt = ChatPromptTemplate.from_template(_prompt_raw.replace("__EVENT_WHITELIST__", _event_whitelist))
 
-        # 5. 检索配置：按规则召回完整规则，不 rerank
-        self._retrieve_k = 20  # chunk 检索数量，用于得到候选规则 ID
-        self._retrieve_score_threshold = 0.35
-        self._max_rules = 6  # 最多送入 LLM 的规则条数（硬上限）
+        # 5. 检索配置：按规则召回完整规则，不 rerank（参数已在 __init__ 开头从 kwargs/env 设置）
         self.retriever = self.vectorstore.as_retriever(search_kwargs={"k": self._retrieve_k})
         self.retriever_with_score = self.vectorstore.as_retriever(
             search_type="similarity_score_threshold",
             search_kwargs={"k": self._retrieve_k, "score_threshold": self._retrieve_score_threshold}
         )
 
+        # 6. 构建主链路：规则上下文 + case 示例 + 原始文本 → LLM → JSON 字符串
         self.chain = (
-            {"context": RunnableLambda(self._retrieve_rules_full) | RunnableLambda(self._format_docs), "input": RunnablePassthrough()}
+            {
+                "context": RunnableLambda(self._retrieve_rules_full) | RunnableLambda(self._format_docs),
+                "cases_context": RunnableLambda(self._build_cases_context),
+                "input": RunnablePassthrough(),
+            }
             | prompt
             | self.llm
-            | StrOutputParser()
+            | RunnableLambda(self._capture_and_parse_llm_output)
         )
 
     def _format_docs(self, docs):
         """格式化检索到的文档"""
         return "\n\n---\n\n".join(doc.page_content for doc in docs)
+
+    def _capture_and_parse_llm_output(self, llm_output: Any) -> str:
+        """
+        保存本次 LLM 调用的 request_id，并返回纯文本内容。
+
+        ChatOpenAI.invoke 一般返回 AIMessage，response_metadata 中会带有 request_id。
+        """
+        # 提取 request_id 供日志追踪
+        try:
+            meta = getattr(llm_output, "response_metadata", {}) or {}
+            self._last_request_id = meta.get("request_id") or meta.get("request-id")
+        except Exception:
+            self._last_request_id = None
+
+        # 提取文本内容
+        try:
+            content = llm_output.content  # AIMessage
+        except Exception:
+            content = str(llm_output)
+
+        # 记录到日志（仅在存在 request_id 时）
+        if self._last_request_id:
+            logger.info(f"ComplianceRAGEngine LLM 调用完成，request_id={self._last_request_id}")
+
+        return content
+
+    # ==============================
+    # case 向量库相关
+    # ==============================
+
+    def _initialize_case_store(self):
+        """从 src/cases 下的 per-event markdown 中构建 good/bad case 向量库。"""
+        from glob import glob
+
+        self.case_vectorstore = None
+        self._case_docs: List[Document] = []
+        self._rule_calibration: Dict[int, str] = {}  # rule_id -> 易错说明（人工校准提示）
+        self._good_case_texts_by_rule: Dict[int, List[str]] = {}
+        self._good_case_embeddings_by_rule: Dict[int, List[List[float]]] = {}
+        self._bad_case_texts_by_rule: Dict[int, List[str]] = {}
+        self._bad_case_embeddings_by_rule: Dict[int, List[List[float]]] = {}
+        self._calibration_hints: Dict[int, Dict[str, List[str]]] = {}
+        self._structured_calibration_rules: Dict[int, List[Dict[str, Any]]] = {}
+
+        base_dir = os.path.dirname(os.path.abspath(__file__))
+        cases_dir = os.path.join(base_dir, "cases")
+        if not os.path.isdir(cases_dir):
+            return
+
+        pattern = os.path.join(cases_dir, "E??_*.md")
+        file_paths = sorted(glob(pattern))
+        if not file_paths:
+            return
+
+        docs: List[Document] = []
+
+        for path in file_paths:
+            filename = os.path.basename(path)
+            # 解析规则 ID（E01_E02...）
+            m = re.match(r"E(\d{2})_.*\.md", filename)
+            if not m:
+                continue
+            try:
+                rule_id = int(m.group(1))
+            except ValueError:
+                continue
+            rule_name = self._get_rule_name_by_id(rule_id)
+
+            try:
+                with open(path, "r", encoding="utf-8") as f:
+                    content = f.read()
+            except Exception:
+                continue
+
+            # 简单按 markdown 小标题解析 Definition / Bad cases / Good cases / 易错说明
+            sections = self._split_case_markdown(content)
+            definition = sections.get("definition", "").strip()
+            bad_cases = sections.get("bad cases", [])
+            good_cases = sections.get("good cases", [])
+            calibration = (sections.get("calibration") or "").strip()
+            if calibration:
+                self._rule_calibration[rule_id] = calibration
+                self._calibration_hints[rule_id] = self._parse_calibration_hints(calibration)
+            calibration_rules_text = (sections.get("calibration rules") or "").strip()
+            if calibration_rules_text:
+                parsed_rules = self._parse_structured_calibration_rules(calibration_rules_text)
+                if parsed_rules:
+                    self._structured_calibration_rules[rule_id] = parsed_rules
+            elif calibration:
+                auto_rules = self._compile_calibration_rules_from_text(calibration)
+                if auto_rules:
+                    self._structured_calibration_rules[rule_id] = auto_rules
+
+            if definition:
+                docs.append(
+                    Document(
+                        page_content=f"[DEFINITION][规则{rule_id}:{rule_name}] {definition}",
+                        metadata={
+                            "rule_id": rule_id,
+                            "rule_name": rule_name,
+                            "case_type": "definition",
+                            "file": filename,
+                        },
+                    )
+                )
+
+            for text in bad_cases:
+                text = text.strip()
+                if not text:
+                    continue
+                self._bad_case_texts_by_rule.setdefault(rule_id, []).append(text)
+                docs.append(
+                    Document(
+                        page_content=f"[BAD][规则{rule_id}:{rule_name}] {text}",
+                        metadata={
+                            "rule_id": rule_id,
+                            "rule_name": rule_name,
+                            "case_type": "bad",
+                            "file": filename,
+                        },
+                    )
+                )
+
+            for text in good_cases:
+                text = text.strip()
+                if not text:
+                    continue
+                self._good_case_texts_by_rule.setdefault(rule_id, []).append(text)
+                docs.append(
+                    Document(
+                        page_content=f"[GOOD][规则{rule_id}:{rule_name}] {text}",
+                        metadata={
+                            "rule_id": rule_id,
+                            "rule_name": rule_name,
+                            "case_type": "good",
+                            "file": filename,
+                        },
+                    )
+                )
+
+        if not docs:
+            return
+
+        self._case_docs = docs
+        self.case_vectorstore = FAISS.from_documents(docs, self.embeddings)
+        self.case_retriever = self.case_vectorstore.as_retriever(search_kwargs={"k": 50})
+
+        # 预先缓存 good case 向量，用于“good case 强匹配减分”
+        try:
+            for rid, texts in self._good_case_texts_by_rule.items():
+                if not texts:
+                    continue
+                vectors = self.embeddings.embed_documents(texts)
+                if vectors:
+                    self._good_case_embeddings_by_rule[rid] = vectors
+            for rid, texts in self._bad_case_texts_by_rule.items():
+                if not texts:
+                    continue
+                vectors = self.embeddings.embed_documents(texts)
+                if vectors:
+                    self._bad_case_embeddings_by_rule[rid] = vectors
+        except Exception as e:
+            logger.warning(f"初始化 case 向量失败: {e}")
+            self._good_case_embeddings_by_rule = {}
+            self._bad_case_embeddings_by_rule = {}
+
+    def _split_case_markdown(self, content: str) -> Dict[str, Any]:
+        """
+        解析单个 case markdown：
+        期望小标题为：
+        - ## Definition
+        - ## Bad cases
+        - ## Good cases
+        返回：
+        {
+          "definition": "xxx",
+          "bad cases": ["句1", "句2"],
+          "good cases": ["句A", "句B"]
+        }
+        """
+        lines = content.splitlines()
+        sections: Dict[str, List[str]] = {}
+        current_key = None
+
+        for line in lines:
+            header_match = re.match(r"^##\s+(.*)", line.strip())
+            if header_match:
+                header = header_match.group(1).strip().lower()
+                if header.startswith("definition"):
+                    current_key = "definition"
+                elif header.startswith("bad"):
+                    current_key = "bad cases"
+                elif header.startswith("good cases"):
+                    current_key = "good cases"
+                elif header.startswith("good"):
+                    # 兼容只写 Good 的情况
+                    current_key = "good cases"
+                elif header.startswith("risk keywords"):
+                    current_key = "risk keywords"
+                elif header.startswith("strong protection keywords"):
+                    current_key = "strong protection keywords"
+                elif header.startswith("calibration rules") or header.startswith("校准规则"):
+                    current_key = "calibration rules"
+                elif header.startswith("易错说明") or header.startswith("calibration"):
+                    current_key = "calibration"
+                else:
+                    current_key = None
+                if current_key not in sections:
+                    sections[current_key] = []
+                continue
+
+            if current_key:
+                sections.setdefault(current_key, []).append(line)
+
+        result: Dict[str, Any] = {}
+        if "definition" in sections:
+            result["definition"] = "\n".join(sections["definition"]).strip()
+
+        def _extract_list(items: List[str]) -> List[str]:
+            out: List[str] = []
+            for l in items:
+                s = l.strip()
+                if not s:
+                    continue
+                # markdown 列表项 "- xxx"
+                s = re.sub(r"^[-*+]\s*", "", s)
+                if s:
+                    out.append(s)
+            return out
+
+        if "bad cases" in sections:
+            result["bad cases"] = _extract_list(sections["bad cases"])
+        if "good cases" in sections:
+            result["good cases"] = _extract_list(sections["good cases"])
+        if "risk keywords" in sections:
+            result["risk keywords"] = _extract_list(sections["risk keywords"])
+        if "strong protection keywords" in sections:
+            result["strong protection keywords"] = _extract_list(sections["strong protection keywords"])
+        if "calibration" in sections:
+            result["calibration"] = "\n".join(sections["calibration"]).strip()
+        if "calibration rules" in sections:
+            result["calibration rules"] = "\n".join(sections["calibration rules"]).strip()
+
+        return result
+
+    def _retrieve_case_examples(self, text: str, candidate_rule_ids: List[int], k_per_rule: int = 3) -> Dict[int, Dict[str, List[str]]]:
+        """
+        在 case 向量库中检索与文本最相似的 bad/good case。
+        返回结构：
+        {
+          rule_id: {
+            "bad": [句1, 句2],
+            "good": [句A, 句B],
+          },
+          ...
+        }
+        """
+        result: Dict[int, Dict[str, List[str]]] = {}
+        if not getattr(self, "case_vectorstore", None) or not candidate_rule_ids:
+            return result
+
+        text = self._normalize_input_text(text)
+        # 先全局检索一批，再按 rule_id 过滤聚合
+        try:
+            docs = self.case_retriever.invoke(text)
+        except Exception:
+            docs = []
+
+        for doc in docs:
+            rid = doc.metadata.get("rule_id")
+            if rid not in candidate_rule_ids:
+                continue
+            case_type = doc.metadata.get("case_type", "")
+            if case_type not in ("bad", "good"):
+                continue
+            # 去掉前缀标签，仅保留原始句子
+            content = doc.page_content
+            content = re.sub(r"^\[[A-Z]+\]\[[^\]]+\]\s*", "", content).strip()
+            if not content:
+                continue
+
+            bucket = result.setdefault(rid, {"bad": [], "good": []})
+            lst_key = "bad" if case_type == "bad" else "good"
+            if len(bucket[lst_key]) >= k_per_rule:
+                continue
+            if content not in bucket[lst_key]:
+                bucket[lst_key].append(content)
+
+        return result
+
+    def _cosine_similarity(self, vec_a: List[float], vec_b: List[float]) -> float:
+        """计算两个向量的余弦相似度。"""
+        if not vec_a or not vec_b or len(vec_a) != len(vec_b):
+            return 0.0
+        dot = sum(a * b for a, b in zip(vec_a, vec_b))
+        norm_a = math.sqrt(sum(a * a for a in vec_a))
+        norm_b = math.sqrt(sum(b * b for b in vec_b))
+        if norm_a == 0.0 or norm_b == 0.0:
+            return 0.0
+        return dot / (norm_a * norm_b)
+
+    def _best_good_case_match(self, text_embedding: List[float], rule_id: int, input_text: str = "") -> Tuple[float, str]:
+        """
+        返回某条规则下，输入文本与 good case 的最高相似度及命中的 good case 文本。
+        若无可用 good case，返回 (0.0, "")。
+        """
+        vectors = self._good_case_embeddings_by_rule.get(rule_id) or []
+        texts = self._good_case_texts_by_rule.get(rule_id) or []
+        if not text_embedding or not vectors or not texts:
+            return 0.0, ""
+
+        best_sim = 0.0
+        best_text = ""
+        for idx, vec in enumerate(vectors):
+            candidate = texts[idx] if idx < len(texts) else ""
+            if not self._polarity_consistent(input_text, candidate):
+                continue
+            sim = self._cosine_similarity(text_embedding, vec)
+            if sim > best_sim:
+                best_sim = sim
+                best_text = candidate
+        return best_sim, best_text
+
+    def _best_bad_case_match(self, text_embedding: List[float], rule_id: int, input_text: str = "") -> Tuple[float, str]:
+        """
+        返回某条规则下，输入文本与 bad case 的最高相似度及命中的 bad case 文本。
+        若无可用 bad case，返回 (0.0, "")。
+        """
+        vectors = self._bad_case_embeddings_by_rule.get(rule_id) or []
+        texts = self._bad_case_texts_by_rule.get(rule_id) or []
+        if not text_embedding or not vectors or not texts:
+            return 0.0, ""
+
+        best_sim = 0.0
+        best_text = ""
+        for idx, vec in enumerate(vectors):
+            candidate = texts[idx] if idx < len(texts) else ""
+            if not self._polarity_consistent(input_text, candidate):
+                continue
+            sim = self._cosine_similarity(text_embedding, vec)
+            if sim > best_sim:
+                best_sim = sim
+                best_text = candidate
+        return best_sim, best_text
+
+    def _normalize_case_text(self, s: str) -> str:
+        """用于 bad/good case 字面匹配：去空白和常见标点，转小写。"""
+        if not s:
+            return ""
+        s = s.lower().strip()
+        s = re.sub(r"[\s，。！？!?,；;：“”\"'、\(\)\[\]【】]", "", s)
+        return s
+
+    def _contains_negation(self, s: str) -> bool:
+        s = s or ""
+        return any(t in s for t in self.NEGATION_TERMS)
+
+    def _polarity_consistent(self, text: str, case_text: str) -> bool:
+        """否定极性一致性：一方是否定、另一方非否定，则判为不一致。"""
+        return self._contains_negation(text) == self._contains_negation(case_text)
+
+    def _literal_case_match(self, text: str, case_text: str) -> bool:
+        """字面匹配：case 是否包含于文本或文本包含于 case。"""
+        if not self._polarity_consistent(text, case_text):
+            return False
+        a = self._normalize_case_text(text)
+        b = self._normalize_case_text(case_text)
+        if not a or not b:
+            return False
+        return b in a or a in b
+
+    def _is_risk_assessment_context(self, text: str) -> bool:
+        """Detect questionnaire/risk-assessment workflow context."""
+        if not text:
+            return False
+        patterns = [
+            r"风险测评|风测|测评|问卷|风险问卷",
+            r"第\s*\d+\s*题|A\s*[、\.．)]?\s*|B\s*[、\.．)]?\s*|C\s*[、\.．)]?\s*|D\s*[、\.．)]?\s*",
+            r"及格|通过|重测|重新测评|测评分",
+        ]
+        return any(re.search(p, text, re.IGNORECASE) for p in patterns)
+
+    def _has_assessment_steering(self, text: str) -> bool:
+        """Detect explicit steering/tampering in risk assessment context."""
+        if not text:
+            return False
+        if not self._is_risk_assessment_context(text):
+            return False
+
+        strong_patterns = [
+            r"我说几号你就选几号|按我说的填|照着我说的填|听我选",
+            r"选\s*[ABCD]\s*才(能)?过|别选(保守|低风险)|必须选\s*[ABCD]",
+            r"往高了填|改高一点|做高一点|填高一点",
+            r"这样才能过|保证通过|包过|一定通过",
+            r"身份证(随便填|乱填|填别人)|姓名(随便填|乱填|填别人)",
+        ]
+        if any(re.search(p, text, re.IGNORECASE) for p in strong_patterns):
+            return True
+
+        # Soft guidance alone is not considered interference.
+        soft_only_patterns = [
+            r"随便选一个|随便填|都可以|没有标准答案|只要不空着就行",
+        ]
+        if any(re.search(p, text, re.IGNORECASE) for p in soft_only_patterns):
+            return False
+
+        return False
+
+    def _get_e13_service_intro_keywords(self) -> List[str]:
+        return [
+            "老师", "老师的建议", "特训营", "APP", "app", "微信", "查看", "推送", "具体的股票", "止盈区间",
+            "止损区间", "止盈止损区间", "选股器", "二维码",
+            "会给你", "会给到", "会告诉你", "会推送", "会提示", "会通知",
+            "合作后", "加入后", "加入合作之后","合作之后","根据安排来", "内部", "系统会", "软件会", "老师会",
+            "盘中会", "统一推送", "会员", "服务期", "体验期", "带你", "跟上",
+            "都会给到", "都会发", "内部会员", "内部服务", "办理", "办理通道",
+            "明确的代码", "明确的股票代码", "什么价位买", "什么价位时间卖", "价格区间去买", "价格区间去卖出", "直接指导",
+            "投资顾问", "执业编号", "个人观点", "不构成您投资的依据", "不构成投资依据", "风险自担", "独立决策",
+            "助教", "老师助教", "专业老师", "专业老师助教", "发送到你手机", "发送到手机", "手机里提示", "发到手机",
+            "解套方案", "服务范围之内", "票质量怎么样", "加入进来之后",
+            "买卖点位", "指导建议", "微信通知", "发微信通知", "电话再提醒", "打个电话再提醒", "走申请", "带你办理",
+            "跟上老师的步伐", "图片里面写", "写的很详细", "确保一定不会错过","特许营","黄金杯", "严选量投","研选量投", "内部策略", "高级助教", "模型选股", "股池", "系统", "软件", "模型案例",
+        "趋势智投","私人定制","三步点金","解套王","解套王指标","机构跟投","投研跟投","案例精选","金牌客服","服务顾问","选股魔方",
+        "主力先锋","龙回头","顶底拐点","热点雷达","资金龙虎榜","操盘线","十全十美","波段擒牛","底部强力","超跌精灵","底分拐点","模型精选",
+        "缴费", "续费", "优惠名额", "锁定优惠名额", "服务时间", "赠送服务时间","什么时间方便缴费",
+            "带您走后面的流程", "已经申请好优惠", "申请锁定了优惠名额", "正好98000", "98000",
+            "服务续费", "服务售卖", "服务跟进", "优惠套餐", "办理续费", "办理缴费",
+            "先交定金", "定金", "尾款", "补尾款", "信用卡", "整理账户", "先申请下来"]
+
+    def _analyze_e13_context(self, text: str, summary_reason: str) -> Dict[str, Any]:
+        text = text or ""
+        summary_reason = summary_reason or ""
+        summary_reason_norm = re.sub(r"[\s“”\"'‘’《》〈〉「」『』（）()\[\]【】,，。；;：:、】【]", "", summary_reason)
+
+        service_intro_keywords = self._get_e13_service_intro_keywords()
+        status_check_keywords = [
+            "没买股票", "没买", "为什么没买", "怎么没买", "卖掉了吗", "是不是卖掉了",
+            "是不是清了", "是不是清仓了", "你这个不是卖掉了吗", "今天是什么原因没买股票",
+            "持仓状态", "确认持仓", "看下持仓", "亏大了", "为什么没进",
+            "持有的什么票", "持仓什么票", "现在你是持有的什么票", "你现在拿的什么票", "现在拿的什么票"
+        ]
+        risk_reminder_keywords = [
+            "止盈止损", "设置好严格的止盈止损", "设置好止盈止损", "控制仓位", "避免重仓",
+            "不建议重仓", "不要重仓", "别重仓", "轻仓参与", "仓位控制", "避免被套",
+            "风险分散", "分散风险", "设置止损", "设置止盈"
+        ]
+        education_keywords = [
+            "圆弧底", "洗盘", "杯子", "上涨形态", "形态教学", "二次下砸确认", "主力资金",
+            "主力资金接入", "政策利好方向", "提前释放风险", "形态", "走势", "技术形态",
+            "投教", "教学", "复盘", "策略教学"
+        ]
+        product_keywords = ["特许营","黄金杯", "严选量投","研选量投", "内部策略", "高级助教", "模型选股", "股池", "系统", "软件", "模型案例",
+        "趋势智投","私人定制","三步点金","解套王","机构跟投","投研跟投","案例精选","金牌客服","服务顾问","选股魔方",
+        "主力先锋","龙回头","顶底拐点","热点雷达","资金龙虎榜","操盘线","十全十美","波段擒牛","底部强力","超跌精灵","底分拐点","解套王指标"]
+        action_keywords = ["买入", "卖出", "加仓", "减仓", "持有", "清仓", "止损", "止盈", "做T", "建仓", "平仓"]
+        strong_action_keywords = ["买入", "卖出", "加仓", "减仓", "持有", "清仓", "止损", "止盈", "建仓", "平仓", "离场", "兑现", "出手", "博一搏",
+                                    "买进", "卖掉", "割肉", "补仓", "满仓", "半仓",
+                                    "轻仓", "重仓", "空仓", "进场", "出局", "撤掉",
+                                    "拿住", "拿着", "落袋", "冲高出", "低吸", "高抛",
+                                    "抄底", "逃顶", "开仓", "斩仓", "锁仓",
+                                    "全部卖出", "全部买入", "全部清掉", "全部减掉", "全部离场",
+                                    "马上买", "赶紧卖", "立刻进", "直接卖", "直接买",
+                                    "现在买", "现在卖", "现在清", "现在走",
+                                    "轻仓进", "出掉一些","走掉"]
+        action_patterns = [
+            r"买入", r"卖出", r"加仓", r"减仓", r"持有", r"清仓", r"止损", r"止盈", r"做T", r"建仓", r"平仓",
+            r"离场", r"减仓避险", r"降低持仓成本", r"小仓位试错", r"加仓跟进",
+            r"等待企稳信号", r"关注", r"博一搏", r"试试", r"尝试"
+        ]
+        strong_action_patterns = [
+            r"买入", r"卖出", r"加仓", r"减仓", r"持有", r"清仓", r"止损", r"止盈", r"建仓", r"平仓",
+            r"离场", r"减仓避险", r"降低持仓成本", r"小仓位试错", r"加仓跟进", r"兑现", r"出手",
+            r"博一搏", r"搏一搏", r"(轻仓|半仓).{0,6}(拿|博)"
+        ]
+        condition_keywords = [
+            "现在", "今天", "明天", "马上", "立即", "开盘", "收盘",
+            "全仓", "半仓", "轻仓", "重仓", "跌破", "突破", "回踩", "止损", "止盈",
+            "一半", "一半仓", "减到一半", "三分之一", "1/2", "1/3"
+        ]
+        condition_patterns = [
+            r"现在", r"今天", r"明天", r"马上", r"立即", r"开盘", r"收盘",
+            r"全仓", r"半仓", r"轻仓", r"重仓", r"跌破", r"突破", r"回踩",
+            r"\d+(?:\.\d+)?元", r"\d+(?:\.\d+)?块", r"\d+(?:\.\d+)?~\d+(?:\.\d+)?元",
+            r"\d+(?:\.\d+)?-\d+(?:\.\d+)?元", r"站稳", r"企稳", r"放量突破",
+            r"目标看至", r"逢高", r"下方", r"上方", r"附近",
+            r"一半", r"减到一半", r"减仓一半", r"半仓", r"三分之一", r"1/2", r"1/3"
+        ]
+        negative_summary_phrases = [
+            "不符合规则 13", "不符合规则13", "不构成违规指导", "不属于违规指导",
+            "不符合违规指导", "不触发规则 13", "不触发规则13", "不触发违规指导",
+            "不触发规则 13（违规指导）", "不触发规则13（违规指导）", "不触发规则13违规指导",
+            "未涉及证券投资建议", "未涉及任何证券投资建议", "未涉及具体股票标的", "未涉及交易指令",
+            "未涉及收益承诺", "未涉及合同生效时间表述", "未命中规则 13", "未命中规则13",
+            "未命中任何候选违规规则", "不命中任何候选违规规则", "不涉及具体股票标的", "不涉及交易指令",
+            "无违规风险", "无风险因子", "不涉及证券投资建议",
+            "未指定具体个股标的", "未出现具体股票标识", "属于强保护因子",
+            "综合判定为合规", "判定为合规", "合规情形", "服务介绍/转述", "服务介绍", "转述",
+            "投资顾问", "执业编号", "个人观点", "不构成您投资的依据", "不构成投资依据", "风险自担",
+            "故不加分", "缺失规则 13 判定的核心要素", "缺失具体股票标识", "缺失具体股票标的",
+            "未构成针对特定个股的当前可执行指令", "未构成当前可执行指令","不命中规则 13（违规指导）"
+        ]
+
+        target_exclude_keywords = set(
+            service_intro_keywords
+            + product_keywords
+            + [
+                "这个票", "那个票", "这只票", "那只票", "今天一直", "如果说", "可以持有",
+                "考虑暂时", "五日线啊", "老师团队", "全程通知", "统一推送", "内部会员",
+                "指导提示", "价格区间", "核心区间", "强支撑位", "震荡中枢", "压力位",
+                "历史高位", "操作建议", "持仓状态", "空仓状态", "关键观察", "风险提示"
+            ]
+        )
+
+        has_explicit_target = bool(re.search(r"\d{6}", text))
+        if not has_explicit_target:
+            stock_name_suffix_pattern = (
+                r"[\u4e00-\u9fa5]{2,6}"
+                r"(集团|科技|电信|黄金|重工|股份|药业|电子|控股|能源|银行|证券|实业|材料|制造|智能|信息|通信)"
+            )
+            explicit_name_hits = re.findall(stock_name_suffix_pattern, text)
+            if explicit_name_hits:
+                has_explicit_target = True
+
+        if not has_explicit_target:
+            stock_name_candidates = re.findall(r"[A-Za-z\u4e00-\u9fa5]{4,8}", text)  
+            for candidate in stock_name_candidates:
+                if candidate in target_exclude_keywords:
+                    continue
+                if any(keyword in candidate for keyword in target_exclude_keywords):
+                    continue
+                if candidate.endswith(("老师", "团队", "会员", "策略", "软件", "系统")):
+                    continue
+                if len(candidate) == 4 and any("\u4e00" <= ch <= "\u9fa5" for ch in candidate):
+                    has_explicit_target = True
+                    break
+
+        price_point_hits = re.findall(r"\d+(?:\.\d+)?(?:元|块)", text)
+        implicit_target_signal = (
+            len(price_point_hits) >= 2
+            and any(token in text for token in ["这个票", "这只票", "那个票", "那只票", "它", "他"])
+        )
+        has_target = has_explicit_target or implicit_target_signal
+        has_action = any(keyword in text for keyword in action_keywords) or any(re.search(pattern, text) for pattern in action_patterns)
+        has_strong_action = any(keyword in text for keyword in strong_action_keywords) or any(re.search(pattern, text) for pattern in strong_action_patterns)
+        has_condition = any(keyword in text for keyword in condition_keywords) or any(re.search(pattern, text) for pattern in condition_patterns)
+        contains_service_intro = any(keyword in text for keyword in service_intro_keywords)
+        contains_product_name = any(keyword in text for keyword in product_keywords)
+        is_status_check = any(keyword in text for keyword in status_check_keywords)
+        is_risk_reminder = any(keyword in text for keyword in risk_reminder_keywords)
+        is_education_talk = any(keyword in text for keyword in education_keywords)
+        is_capability_sale = (
+            (
+                "内部服务" in text
+                or "办理" in text
+                or "办理通道" in text
+                or "合作之后" in text
+                or "加入合作之后" in text
+            )
+            and (
+                "明确的代码" in text
+                or "明确的股票代码" in text
+                or "什么价位买" in text
+                or "什么价位时间卖" in text
+                or "价格区间去买" in text
+                or "价格区间去卖出" in text
+                or "直接指导" in text
+                or "根据安排来" in text
+            )
+        )
+        if (
+            "加入特许营" in text
+            and "老师团队全程通知" in text
+            and "跟着买跟着卖就好" in text
+        ):
+            contains_service_intro = True
+        if is_status_check or is_risk_reminder or is_education_talk:
+            contains_service_intro = True
+        negative_summary_phrases_norm = [re.sub(r"[\s“”\"'‘’《》〈〉「」『』（）()\[\]【】,，。；;：:、】【]", "", phrase) for phrase in negative_summary_phrases]
+        summary_negates_e13 = any(
+            phrase in summary_reason or phrase_norm in summary_reason_norm
+            for phrase, phrase_norm in zip(negative_summary_phrases, negative_summary_phrases_norm)
+        )
+        summary_supports_e13 = (
+            not summary_negates_e13
+            and (
+                ((("规则 13" in summary_reason or "规则13" in summary_reason) and ("违规指导" in summary_reason or "构成违规指导" in summary_reason)))
+                or ("构成违规指导" in summary_reason or "构成违规指导" in summary_reason_norm)
+                or ("符合规则 13" in summary_reason or "符合规则13" in summary_reason or "符合规则13" in summary_reason_norm)
+                or ("判定为违规指导" in summary_reason or "判定为违规指导" in summary_reason_norm)
+                or ("完全符合规则 13" in summary_reason or "完全符合规则13" in summary_reason or "完全符合规则13" in summary_reason_norm)
+                or ("高风险违规指导特征" in summary_reason or "高风险违规指导特征" in summary_reason_norm)
+            )
+        )
+        rule_supports_e13 = (
+            has_target
+            and has_strong_action
+            and has_condition
+            and not contains_service_intro
+            and not contains_product_name
+            and not is_capability_sale
+        )
+        loose_rule_supports_e13 = (
+            has_action
+            and has_condition
+            and not contains_service_intro
+            and not contains_product_name
+            and not is_capability_sale
+        )
+        should_block_e13 = (
+            contains_service_intro
+            or contains_product_name
+            or is_capability_sale
+            or (not has_target and not implicit_target_signal)
+            or not has_strong_action
+            or not has_condition
+        )
+
+        return {
+            "summary_supports_e13": summary_supports_e13,
+            "summary_negates_e13": summary_negates_e13,
+            "rule_supports_e13": rule_supports_e13,
+            "loose_rule_supports_e13": loose_rule_supports_e13,
+            "should_block_e13": should_block_e13,
+            "contains_service_intro": contains_service_intro,
+            "contains_product_name": contains_product_name,
+            "is_status_check": is_status_check,
+            "is_risk_reminder": is_risk_reminder,
+            "is_education_talk": is_education_talk,
+            "has_target": has_target,
+            "has_action": has_action,
+            "has_strong_action": has_strong_action,
+            "has_condition": has_condition,
+        }
+
+    def _analyze_e01_context(self, text: str, summary_reason: str) -> Dict[str, Any]:
+        text = text or ""
+        summary_reason = summary_reason or ""
+        sentences = [s.strip() for s in re.split(r"[。！？!?；;\n|]", text) if s.strip()]
+
+        promise_terms = ["保证", "一定", "肯定", "肯定要","绝对", "稳赚", "必赚", "包赚", "保本", "包赔", "可以", "能够", "能"]
+        result_terms = ["赚钱", "盈利", "收益", "获利", "回本", "不亏", "翻倍", "赚回来"]
+        result_patterns = [
+            r"\d+\s*个点",
+            r"\d+(?:\.\d+)?\s*%",
+            r"翻倍",
+        ]
+        strong_protection_terms = ["投资有风险", "不保证收益", "不承诺盈利", "不代表未来表现", "不构成收益保证"]
+        negative_summary_terms = ["不构成直接承诺收益", "不属于直接承诺收益", "未承诺收益", "未承诺盈利", "客户自述", "历史盈利事实"]
+
+        has_same_sentence_promise_and_result = False
+        for sent in sentences:
+            has_promise = any(term in sent for term in promise_terms)
+            has_result = any(term in sent for term in result_terms) or any(re.search(pattern, sent) for pattern in result_patterns)
+            if has_promise and has_result:
+                has_same_sentence_promise_and_result = True
+                break
+
+        has_strong_protection = any(term in text for term in strong_protection_terms)
+        summary_negates_e01 = any(term in summary_reason for term in negative_summary_terms)
+        summary_supports_e01 = (
+            ("直接承诺收益" in summary_reason or "规则 1" in summary_reason or "规则1" in summary_reason)
+            and not summary_negates_e01
+        )
+        rule_supports_e01 = has_same_sentence_promise_and_result
+        should_block_e01 = (not rule_supports_e01) or has_strong_protection
+
+        return {
+            "summary_supports_e01": summary_supports_e01,
+            "summary_negates_e01": summary_negates_e01,
+            "rule_supports_e01": rule_supports_e01,
+            "should_block_e01": should_block_e01,
+            "has_strong_protection": has_strong_protection,
+        }
+
+    def _parse_structured_calibration_rules(self, text: str) -> List[Dict[str, Any]]:
+        """
+        解析结构化校准规则（JSON 数组）。
+        支持直接 JSON 或 ```json fenced block```。
+        """
+        if not text:
+            return []
+        raw = text.strip()
+        fence_match = re.search(r"```json\s*(.*?)\s*```", raw, re.IGNORECASE | re.DOTALL)
+        if fence_match:
+            raw = fence_match.group(1).strip()
+        try:
+            obj = json.loads(raw)
+        except Exception:
+            return []
+        if not isinstance(obj, list):
+            return []
+        out: List[Dict[str, Any]] = []
+        for item in obj:
+            if isinstance(item, dict) and isinstance(item.get("type"), str):
+                out.append(item)
+        return out
+
+    def _compile_calibration_rules_from_text(self, calibration_text: str) -> List[Dict[str, Any]]:
+        """
+        从“易错说明”自然语言自动编译基础结构化规则。
+        若未手写 Calibration Rules，可直接使用该编译结果。
+        """
+        if not calibration_text:
+            return []
+
+        lines = [l.strip() for l in calibration_text.splitlines() if l.strip()]
+        compiled: List[Dict[str, Any]] = []
+        numeric_regex = [r"\d+\s*%", r"\d+\s*万", r"\d+\s*块", r"每股", r"一股"]
+
+        for line in lines:
+            rule_type = None
+            if "易误判" in line:
+                rule_type = "false_positive"
+            elif "易漏判" in line:
+                rule_type = "false_negative"
+            if not rule_type:
+                continue
+
+            quoted_terms = re.findall(r"[“\"]([^”\"]+)[”\"]", line)
+            quoted_terms = [q.strip() for q in quoted_terms if q.strip()]
+            rule: Dict[str, Any] = {
+                "type": rule_type,
+                "note": "auto_compiled_from_calibration",
+            }
+            if quoted_terms:
+                rule["any"] = quoted_terms
+
+            has_no_numeric = ("无具体金额" in line) or ("无具体盈利数字" in line) or ("未提盈利数据" in line)
+            has_numeric_required = ("具体盈利数字" in line) or ("金额/百分比" in line) or ("金额、百分比" in line)
+
+            if rule_type == "false_positive" and has_no_numeric:
+                rule["not_regex"] = numeric_regex
+            if rule_type == "false_negative" and has_numeric_required:
+                rule["any_regex"] = numeric_regex
+
+            if "客户/案例" in line or ("客户" in line and "案例" in line):
+                rule["any"] = list(dict.fromkeys((rule.get("any") or []) + ["客户", "案例"]))
+
+            if any(k in rule for k in ("any", "all", "any_regex", "all_regex", "not_any", "not_regex")):
+                compiled.append(rule)
+
+        return compiled
+
+    def _matches_structured_rule(self, text: str, rule: Dict[str, Any]) -> bool:
+        text = text or ""
+
+        def _as_list(v: Any) -> List[str]:
+            if isinstance(v, list):
+                return [str(x) for x in v if str(x).strip()]
+            return []
+
+        any_terms = _as_list(rule.get("any"))
+        all_terms = _as_list(rule.get("all"))
+        not_any_terms = _as_list(rule.get("not_any"))
+        any_regex = _as_list(rule.get("any_regex"))
+        all_regex = _as_list(rule.get("all_regex"))
+        not_regex = _as_list(rule.get("not_regex"))
+
+        if any_terms and not any(t in text for t in any_terms):
+            return False
+        if all_terms and not all(t in text for t in all_terms):
+            return False
+        if not_any_terms and any(t in text for t in not_any_terms):
+            return False
+        if any_regex and not any(re.search(p, text) for p in any_regex):
+            return False
+        if all_regex and not all(re.search(p, text) for p in all_regex):
+            return False
+        if not_regex and any(re.search(p, text) for p in not_regex):
+            return False
+        return True
+
+    def _parse_calibration_hints(self, calibration_text: str) -> Dict[str, List[str]]:
+        """
+        从“易错说明”中抽取可规则化短语：
+        - false_positive: 易误判（应减分/降级）
+        - false_negative: 易漏判（应加分/提级）
+        """
+        hints: Dict[str, List[str]] = {"false_positive": [], "false_negative": []}
+        if not calibration_text:
+            return hints
+
+        lines = [l.strip() for l in calibration_text.splitlines() if l.strip()]
+        for line in lines:
+            bucket = None
+            if "易误判" in line:
+                bucket = "false_positive"
+            elif "易漏判" in line:
+                bucket = "false_negative"
+            if bucket is None:
+                continue
+
+            # 提取中文引号内短语，作为可匹配提示词
+            quoted = re.findall(r"[“\"]([^”\"]+)[”\"]", line)
+            for q in quoted:
+                s = (q or "").strip()
+                if s and s not in hints[bucket]:
+                    hints[bucket].append(s)
+        return hints
+
+    def _has_hard_risk_pattern(self, text: str, rule_id: int) -> bool:
+        """
+        硬风险兜底：命中硬风险结构时，不允许 good case 覆盖。
+        当前先实现规则1（直接承诺收益）的硬风险识别。
+        """
+        if rule_id != 1:
+            return False
+
+        guarantee_re = re.compile(r"(保证|保本|稳赚|一定|肯定|绝对|承诺)")
+        profit_re = re.compile(r"(赚钱|盈利|收益|获利|翻倍|涨停)")
+        sentences = re.split(r"[。！？!?；;\n]", text or "")
+        for sent in sentences:
+            s = sent.strip()
+            if not s:
+                continue
+            if guarantee_re.search(s) and profit_re.search(s):
+                return True
+        return False
+
+    def _has_official_abctougu_addwx_link(self, text: str) -> bool:
+        """
+        Official addwx links are allowed service/onboarding links and should not trigger E07.
+        """
+        t = (text or "").lower()
+        if not t:
+            return False
+        return (
+            "abctougu.com/addwx/index" in t
+            or "crm.abctougu.cn/addwx/index" in t
+        )
+
+    def _has_service_payment_onboarding(self, text: str) -> bool:
+        """
+        Service/payment onboarding flow should not be treated as E07 abnormal account opening.
+        """
+        t = (text or "").lower()
+        if not t:
+            return False
+        keywords = [
+            "支付宝", "扫码", "扫一扫", "二维码", "保存到相册", "相册", "截图", "扫一扫",
+            "支付", "付款", "支付方式", "付款页", "支付页", "开通", "开通服务", "办理", "通道",
+            "内部通道", "服务", "合作后", "合作之后", "加入之后", "加入合作之后", "内部服务",
+            "手机", "手机里", "联系客服"
+        ]
+        return any(keyword.lower() in t for keyword in keywords)
+
+    def _build_cases_context(self, text: Any) -> str:
+        """根据候选规则 ID，从 case 库中选出若干典型 bad/good case 供模型类比参考。"""
+        text_norm = self._normalize_input_text(text)
+        candidate_ids = self._get_candidate_rule_ids(text_norm)
+        if not candidate_ids:
+            return "（未检索到明显相关的案例，可按文本本身独立判断。）"
+
+        # 限制进入上游 Prompt 的候选规则数，避免上下文过长
+        max_rules_for_cases = 4
+        candidate_ids = candidate_ids[:max_rules_for_cases]
+
+        case_map = self._retrieve_case_examples(text_norm, candidate_ids, k_per_rule=3)
+        if not case_map:
+            return "（未检索到明显相关的案例，可按文本本身独立判断。）"
+
+        parts: List[str] = []
+        for rid in candidate_ids:
+            if rid not in case_map and rid not in getattr(self, "_rule_calibration", {}):
+                continue
+            rule_name = self._get_rule_name_by_id(rid)
+            buckets = case_map.get(rid) or {}
+            parts.append(f"【规则{rid}: {rule_name}】")
+            bad_list = buckets.get("bad") or []
+            good_list = buckets.get("good") or []
+            if bad_list:
+                parts.append("  - 典型 BAD cases：")
+                for s in bad_list:
+                    parts.append(f"    - [BAD] {s}")
+            if good_list:
+                parts.append("  - 典型 GOOD cases：")
+                for s in good_list:
+                    parts.append(f"    - [GOOD] {s}")
+            calibration = getattr(self, "_rule_calibration", {}).get(rid)
+            if calibration:
+                parts.append(f"  - 易错提示（人工校准）：{calibration}")
+            parts.append("")
+
+        return "\n".join(parts).strip() or "（未检索到明显相关的案例，可按文本本身独立判断。）"
 
     def _normalize_input_text(self, text: Any) -> str:
         """保证检索/预测入口拿到的是字符串，避免 dict/None 导致 TypeError。"""
@@ -147,6 +1116,12 @@ class ComplianceRAGEngine:
         ordered: List[int] = []
         try:
             semantic_docs = self.retriever_with_score.invoke(text)
+            # 若在设定的相似度阈值下完全检索不到规则块，记录一条带阈值的日志，方便后续评估阈值是否合理
+            if not semantic_docs:
+                logger.info(
+                    f"RAG 语义检索无结果，当前 score_threshold={self._retrieve_score_threshold}; "
+                    f"后续将回退到普通相似度检索并结合关键词匹配。"
+                )
         except Exception:
             semantic_docs = self.retriever.invoke(text)
         for doc in semantic_docs:
@@ -197,30 +1172,63 @@ class ComplianceRAGEngine:
         return result[:20] if len(result) > 20 else result
 
     def _initialize_vector_store(self):
-        """将完整的18条规则分块存储到向量库，并保存每条规则的完整原文供按规则召回。"""
-        full_rules = self._get_full_rules_content()
-        # 按规则ID保存完整规则原文，用于「按规则召回」时返回整条规则，避免漏判
-        self._full_rules_by_id: Dict[int, str] = {i + 1: full_rules[i] for i in range(len(full_rules))}
+        """将完整的20条规则分块存储到向量库；若存在未过期的本地 FAISS 缓存则直接加载，否则构建并落盘。"""
+        _src_dir = os.path.dirname(os.path.abspath(__file__))
+        rules_path = os.path.join(_src_dir, "rules.md")
+        index_dir = os.path.join(_src_dir, "faiss_index")
+        meta_file = os.path.join(index_dir, "meta.txt")
 
+        def _build_full_rules_by_id_and_keyword():
+            full_rules = self._get_full_rules_content()
+            self._full_rules_by_id = {i + 1: full_rules[i] for i in range(len(full_rules))}
+            self._build_rule_keyword_index()
+
+        # 尝试从本地缓存加载（需 rules.md 未变更）
+        if os.path.isdir(index_dir) and os.path.isfile(meta_file):
+            try:
+                with open(meta_file, "r", encoding="utf-8") as f:
+                    saved_mtime = f.read().strip()
+                if os.path.isfile(rules_path) and saved_mtime == str(os.path.getmtime(rules_path)):
+                    self.vectorstore = FAISS.load_local(
+                        index_dir, self.embeddings, allow_dangerous_deserialization=True
+                    )
+                    _build_full_rules_by_id_and_keyword()
+                    self._rule_id_to_docs = {}
+                    for doc in getattr(self.vectorstore.docstore, "_dict", {}).values():
+                        rid = doc.metadata.get("rule_id")
+                        if rid is not None:
+                            self._rule_id_to_docs.setdefault(rid, []).append(doc)
+                    return
+            except Exception:
+                pass
+
+        # 构建向量库
+        full_rules = self._get_full_rules_content()
+        self._full_rules_by_id = {i + 1: full_rules[i] for i in range(len(full_rules))}
         documents = []
         for i, rule_text in enumerate(full_rules):
             rule_id = i + 1
             rule_name = self._get_rule_name_by_id(rule_id)
             chunks = self._split_rule_into_chunks(rule_text, rule_id, rule_name)
             documents.extend(chunks)
-
         self.vectorstore = FAISS.from_documents(documents, self.embeddings)
-        self._rule_id_to_docs: Dict[int, List[Document]] = {}
+        self._rule_id_to_docs = {}
         for doc in documents:
             rid = doc.metadata.get("rule_id")
             if rid is not None:
                 self._rule_id_to_docs.setdefault(rid, []).append(doc)
-
         self._build_rule_keyword_index()
 
-    # 规则正文滑动窗口：按「段」建索引，embedding 能命中任意违规点；送入 LLM 仍用 _full_rules_by_id 整条
-    _chunk_size = 600
-    _chunk_overlap = 200
+        # 落盘并记录 rules.md mtime
+        try:
+            os.makedirs(index_dir, exist_ok=True)
+            self.vectorstore.save_local(index_dir)
+            with open(meta_file, "w", encoding="utf-8") as f:
+                f.write(str(os.path.getmtime(rules_path)))
+        except Exception:
+            pass
+
+    # 规则正文滑动窗口：按「段」建索引，embedding 能命中任意违规点；送入 LLM 仍用 _full_rules_by_id 整条（_chunk_size/_chunk_overlap 在 __init__ 中设置）
 
     def _split_rule_into_chunks(self, rule_text: str, rule_id: int, rule_name: str) -> List[Document]:
         """将单条规则分割成多个小块：滑动窗口覆盖全文 + 语义段（标题/违规情形/排除条款等）。"""
@@ -295,899 +1303,122 @@ class ComplianceRAGEngine:
         return chunks
 
     def _build_rule_keyword_index(self):
-        """构建规则关键词索引"""
+        """从 src/cases/*.md 中构建规则关键词索引，便于人工在 Markdown 中维护。"""
+        from glob import glob
+
         self.rule_keywords = {}
-        
-        # 为每条规则定义关键词
-        keyword_definitions = {
-            1: ["保证", "承诺", "一定", "肯定", "绝对", "赚钱", "盈利", "收益", "获利", "包赔", "稳赚", "保本"],
-            2: ["报喜", "赚了", "盈利", "翻倍", "涨停", "本金", "收益", "回血", "翻身", "持仓", "截图", "晒单"],
-            3: ["大涨", "涨停", "连板", "狂飙", "暴涨", "涨幅", "牛股", "妖股", "战绩", "案例"],
-            4: ["调研", "一手资料", "内幕", "知根底", "了如指掌", "机构", "持仓"],
-            5: ["电话", "手机号"],
-            6: ["抓涨停", "翻倍", "回血", "回本", "暴涨", "吃肉", "捡钱", "稳赚", "本金无忧"],
-            7: ["开户", "券商", "佣金", "最低", "诱导", "加微信"],
-            8: ["风险测评", "选C", "选最高", "填高", "教唆", "修改", "别选", "错误选项"],
-            9: ["合同", "生效", "起始", "下周", "明天", "推迟", "日期"],
-            10: ["傻逼", "脑残", "穷鬼", "垃圾", "废物", "白痴", "蠢货", "骂人"],
-            11: ["退款", "退费", "退钱", "不满意退", "随时退", "全额退", "无理由退"],
-            12: ["他人身份", "家人身份", "朋友身份", "借身份", "用别人"],
-            13: ["买入", "卖出", "持有", "减仓", "清仓", "止损", "做T", "调仓", "压力位"],
-            14: ["对标", "复制", "一样", "走势", "涨停", "翻倍", "涨幅", "目标", "历史"],
-            15: ["明日", "尾盘", "建仓", "跟上", "代码", "买卖区间", "锁定", "名额"],
-            16: ["沈杨老师", "沈老师", "亲选", "亲自", "亲自给票", "亲自带队", "亲自通知", "亲自推送", "亲自陪伴"],
-            17: ["礼物", "红包", "赠送", "收受", "寄给您", "一点心意", "寄个东西", "给您带点", "寄点特产", "一点小意思", "请我吃饭", "到你的城市玩", "你请客"],
-            18: ["重仓", "小打小闹", "开仓", "机构重仓", "重仓参与", "上仓位", "重仓操作", "机构重仓股", "重仓王股", "调研复核", "带客户重仓"]
-        }
-        
-        for rule_id, keywords in keyword_definitions.items():
-            self.rule_keywords[rule_id] = keywords
+        self.rule_protection_keywords: Dict[int, List[str]] = {}
+
+        base_dir = os.path.dirname(os.path.abspath(__file__))
+        cases_dir = os.path.join(base_dir, "cases")
+        if not os.path.isdir(cases_dir):
+            return
+
+        pattern = os.path.join(cases_dir, "E??_*.md")
+        for path in sorted(glob(pattern)):
+            filename = os.path.basename(path)
+            m = re.match(r"E(\d{2})_.*\.md", filename)
+            if not m:
+                continue
+            try:
+                rule_id = int(m.group(1))
+            except ValueError:
+                continue
+
+            try:
+                with open(path, "r", encoding="utf-8") as f:
+                    content = f.read()
+            except Exception:
+                continue
+
+            sections = self._split_case_markdown(content)
+            risk_keywords = sections.get("risk keywords", []) or []
+            strong_protection_keywords = sections.get("strong protection keywords", []) or []
+
+            # 用于触发候选规则的关键词：只使用风险侧关键词，避免保护性词汇拉高风险匹配分
+            cleaned_risk = [k.strip().lower() for k in risk_keywords if k.strip()]
+            if cleaned_risk:
+                self.rule_keywords[rule_id] = cleaned_risk
+
+            cleaned_protect = [k.strip().lower() for k in strong_protection_keywords if k.strip()]
+            if cleaned_protect:
+                self.rule_protection_keywords[rule_id] = cleaned_protect
 
     def _get_rule_name_by_id(self, rule_id: int) -> str:
         """根据规则ID获取规则名称"""
-        rule_names = {
-            1: "直接承诺收益",
-            2: "突出客户盈利反馈", 
-            3: "突出描述个股涨幅绩效",
-            4: "对投研调研活动夸大宣传",
-            5: "向客户索要手机号",
-            6: "使用敏感词汇",
-            7: "异常开户",
-            8: "干扰风险测评独立性",
-            9: "错误表述服务合同生效起始周期",
-            10: "不文明用语",
-            11: "以退款为营销卖点",
-            12: "怂恿客户使用他人身份办理服务",
-            13: "违规指导",
-            14: "将具体股票策略接入权限作为即时办理卖点",
-            15: "虚假宣传案例精选及人工推票",
-            16: "冒用沈杨老师名义",
-            17: "收受客户礼品",
-            18: "夸大宣传策略重仓操作",
-        }
-        return rule_names.get(rule_id, f"规则{rule_id}")
+        return self.RULE_NAMES.get(rule_id, f"规则{rule_id}")
 
     def _get_full_rules_content(self) -> List[str]:
-        """返回完整的1条规则内容"""
-        # 这里返回您提供的完整16条规则
-        # 由于代码长度限制，我只展示前2条完整的规则，您需要将16条完整规则都放进来
-        return [
-            """### 1. 直接承诺收益视为违规！！
-**【前置强制判断流程：先看"保证"了什么】**
-**在执行下方所有规则前，请先按此流程判断（此流程具有最高优先级）：**
-
-**第一步：句子隔离。**
-将文本按句号、问号、感叹号、换行符分割为独立的短句。**后续分析以短句为单位，严禁跨句组合解读。**
-
-**第二步：逐句扫描"保证"句。**
-对每个包含 **"保证"**、**"保"**、**"承诺"** 一词的短句，执行以下判断：
-1.  **检查"保证"后的核心宾语**：
-    *   如果该短句中，"保证"一词后**直接或间接指向**的是 **"价格"、"费用"、"续费"、"产品"、"代码"、"通知"、"到位"、"没问题"、"一样"、"同一款"、"同标准"、"个股一致"** 等**描述服务属性、商业模式、流程或交付内容一致性**的词汇 → **判定该句为"服务保证"，绝对合规**。**分析到此结束，不再关联其他句子。**
-    *   如果该短句中，"保证"一词后**直接或间接指向**的是 **"赚钱"、"盈利"、"获利"、"收益"** 等**描述金钱投资收益结果**的词汇 → 该句**可能违规**，标记后交由下方"三要素"标准进行最终验证。
-2.  **关键原则**：一个"保证"**只对其所在的短句内容负责**。严禁将对"服务"的保证，错误地关联到其他句子的"收益"描述上。
-
-**第三步：处理非"保证"句。**
-对于所有不包含"保证"的短句，直接使用下方的"三要素"标准进行判断。
-
-**【新增核心豁免：业务逻辑与商业愿景】**
-**遇到以下逻辑解释或愿景描述时，必须判定为合规：**
-- **合规（续费逻辑说明）**：解释"带你赚钱是为了让你未来续费"。例如："先带你赚到钱，你之后才会原价续费，我们赚的是续费的钱"、"你赚不到钱我们也没法长期合作"。这属于**商业盈利模式的说明**，而非对投资收益的法律保证。
-- **合规（双赢对赌/愿景）**：例如："我们比你更希望你赚钱，因为你做好了才会长期跟我们做"。这种表达**互利共赢目标**的话术，不属于违规。
-
-**【新增核心豁免：互动式/挑战式营销话术】**
-- **合规（锦旗/请客邀约）**：使用带有**问号**或**互动语气**的挑战话术。例如：**"账户增值20%以上给思兵送个锦旗好吗？"**、**"下周赚了钱记得请我吃饭哈"**。这属于营销中的情感调动，不构成确定性承诺。
-
-##最高优先级：所有的诱导和暗示视为不违规，请勿加戏过度解读##
-
-**违规判定条件（必须同时满足以下三个条件）：** 
-1.  **主语明确为服务方**（如"我"、"我们"、"老师"等）。
-2.  **语气为确定性承诺**（如"保证"、"一定"、"肯定"、"绝对"等）。**"信我"、"相信我"、"...好吗？"（问句）、"...可以吗？"（问句）等不是承诺语气。**
-3.  **内容必须是对未来投资收益的直接保证**，且保证内容必须**具体化**。
-
-**【情景隔离与禁止关联原则（强化版）】**
-**严禁建立因果关系或进行组合解读：**
-1.  **历史战绩展示（如：某票涨50%） + 邀约愿景（如：预约一个名额，争取早点报喜）**：历史数据不代表未来保证，两者隔离，**整体合规**。
-2.  **否定式陈述**：如"我保证你百分之百赚钱，你敢相信吗？那肯定我成骗子了"。这是在**反向撇清**，**绝对合规**。
-
-**具体违规情形（必须字面完全匹配）：**
-- "我保证你能赚钱"、"我们保证你一定盈利"、"加入后肯定能赚钱"、"亏损包赔"。
-- "我们可以帮你赚十多个点，二十多个点"（**非问句、非可能性描述的直接保证**）。
-
-**绝对排除条款（以下情况一律不视为违规）：**
-- **对服务一致性、真实性的保证**：**"我保证（个股）跟特训营一模一样"**、**"我保证给您展示的案例绝对真实"**。
-- **对商业条件的保证**：**"保证这一年不用再交钱"**、**"保证没有任何套路"**、**"承诺保价"**。
-- **服务信心与愿望表达**：**"保证您过年前一定会感谢我"**（感谢不等于金钱收益）、**"愿您有所收获"**。
-- **可能性/盈亏比探讨**：**"做得好的有十几个点，甚至翻倍的都有"**。提到"翻倍"是描述**历史可能性或整体策略表现**，非对该客户个体的直接收益保证。
-- **对服务缺失解决的保证**：**"我保证随叫随到"**、**"负责到底"**。
-- **反问句/疑问句表达**：**"账户增值20%送个锦旗好吗？"**。核心在结尾是**问号**，属于邀约互动，不构成承诺。
-- **任何关于"报喜"的期望**：**"争取早点来报喜"**。
-
-**重要说明：**
-- **"我保证..."后接服务描述（如同款、合同、发票、不看资金）**是对**服务公平性或标准性**的承诺，不视为收益承诺。
-- **"先带您赚钱体验"**：这属于**服务目的**的描述，并非对未来结果的确定性法律保证。
-- **"赚100块嘛"**：语境为低价股操作建议或安慰性表述，非正式收益承诺。
-- **"服务100%没问题"**：保证的是**交付质量**。
-- **关联性禁止**：严禁将"保证服务一样"与"历史票涨50%"进行脑补关联，判定为保证收益50%。
-
-**最终判决原则：**
-**必须严格遵循"字面匹配"原则**，如果没有出现"保证/一定/肯定"+"具体的金钱收益结果"这种**死线结构**，且该保证是指向**服务、价格、发票、内容一致性、回访等**，一律判定为**合规**。""",
-            
-            
-
-"""### 2. 突出客户盈利反馈视为违规！！
-**核心逻辑：**
-此规则用于打击**"晒单/案例营销"**。
-**判定关键：** 只有当引用第三方案例是明确为了展示**具体的赚钱数额、涨幅比例、翻倍倍数或账户资产的实质性增值**时，才视为违规。**模糊的报喜（不带数字）、对服务实力的认可、对服务费价值的认可、或仅提及入场本金/门槛而未提及盈利结果的，应判定为合规。**
-
-**【关键区分指令（修正核心）】：**
-必须严格区分**"投资回报"**（违规）与**"满意度/报喜/认可/本金陈述"**（合规）。
-- 客户/案例说"赚了XX万"、"翻倍了"、"每股赚了X元"、"涨了XX%"、"回血了（指资金填平）" -> **违规**。
-- 客户/案例说"报喜了"、"太好了"、"几千块本金也能办"、"这服务费花得值"、"连续报喜多次" -> **合规**（感性认可或门槛陈述）。
-
-**具体违规情形（满足以下任意一种即违规）：**
-
-**1. 具体的"本金/时间+收益"数据承诺或展示：**
-*   **【本金+收益】模式**：出现具体盈利数字。如："10万本金赚20万"、"14万一周赚7万5"。
-*   **【时间+收益】模式**：明确承诺/展示具体时间内获利。如："一周赚10万"、"3天获利50%"。
-*   **【个股+比例/空间】模式**：**直接列举多个个股及其涨幅比例。如："航天发展50%、方正电机20%、海南发展50%"（这种属于用历史战绩做收益暗示，视为违规）。**
-
-**2. 带有具体金钱、比例或"每股收益"的盈利报喜：**
-*   引用客户案例时，包含了具体的钱数、涨幅点数或每股赚了多少。
-    *   *违规示例*："学员报喜，**赚了3万多/赚了八万块**"、"拿到了**8000块的彩头**"。
-    *   *违规示例*："入选价11.96元，最高23块多，**一股赚了11块多**"（**计算每股盈利属于明确的收益展示**）。
-    *   *违规示例*："买了就**大涨/肯定赚钱了**"（**虽无数字，但若紧随特定客户案例且语境明确指向该客户因建议而获利，视为定性承诺，违规**）。
-
-**3. 明确的"账户翻身"与涉及资产规模的描述：**
-*   强调加入后资产翻倍、账户大变身。
-    *   *违规示例*："**账户从亏损到翻身**"、"**资金上千万的大佬**也主动发持仓说收获多"（**利用他人巨额资产或持仓截图来侧面印证收益，视为违规**）。
-
-**4. 极高胜率/全胜的绝对化描述：**
-*   描述客户买的票**全部涨停**或**从未亏损**。
-
----
-
-**绝对排除条款（以下情况一律不违规）：**
-
-**1. 模糊的"报喜"与"评价"（核心补丁）：**
-*   **判定标准**：仅提及"报喜"、"给力"、"收获多"、"报喜次数"，但**完全没有**提及具体赚了多少钱、多少百分比或每股赚多少。
-*   *合规示例*："合作2个月一直报喜说收获非常多（未提钱数）"、"一周报喜2次，说198太值了"、"**您看他连续4次报喜，状态非常好**"。
-
-**2. 服务价值、实力认可与避险（原规则保留）：**
-*   评价老师专业、厉害，或表达由于服务避免了损失。
-*   *合规示例*："实力确实给力"、"点位真准"、"要不是你们我就亏死了（避险）"。
-
-**3. "过去亏损"或"起始本金/门槛"作为背景描述：**
-*   **起始本金说明**：提及客户投入的本金少、资金量小，只要不涉及后续赚了多少钱，均视为业务门槛介绍，属于合规。
-*   *合规示例*："**李哥就2000的资金，也果断办理了合作**"、"**杜姐3000本金，合作后也说花的值得**"、"小资金跟上我们合作也挺好"。
-*   *合规示例*："以前自己操作赔了一个月，合作后立马有效果（未提赚多少钱，属状态描述，合规）"。
-
-**4. 服务门槛、价格与市场客观行情（非案例）：**
-*   *合规示例*："198元可以享受半年服务"、"景旺电子3天3板（陈述客观行情，非指特定客户获利，合规）"。
-
----
-
-**最终判断逻辑（严格执行）：**
-1.  **第一步：看有没有具体"盈利钱数"、"百分比"或"每股盈利"。**
-    *   **关键点**：如果出现的数字是**“本金”**（如：2000资金、3000本金）或**“服务费”**（如：198元），且没有提到对应的**“赚了多少”**，则**合规**。
-    *   如果有具体盈利数字（如：**赚八万**、**一股赚11块**、**涨了50%**）且主体是案例/客户 -> **违规**。
-2.  **第二步：区分"行情陈述"与"收益展示"。**
-    *   "这票涨了50%" -> **合规**（客观事实）。
-    *   "客户做了这票赚了50% / 我给客户带出的票：航天发展50%，方正电机20%" -> **违规**（晒单）。
-3.  **第三步：看主体。**
-    *   如果是"展示他人持仓/他人千万资产/他人转介绍并提到了赚多少钱" -> **违规**。
-
-**强制指令：**
-- **严禁**仅因为出现"报喜"、"收获多"、"太牛了"就判定违规。
-- **严禁**将“描述客户本金少/小资金合作”判定为违规，只要其未展示具体的盈利增值数据。
-- **重点关注语音转文本内容：** 若文本看起来模糊（如"收获很多"），但语音转文本中出现了具体金额（如"赚了八万"），必须判定为**违规**。
-- **严禁**将"个股+涨幅百分比"的组合营销展示视为客观行情，此种情况属于典型的案例营销（晒单），应判定为**违规**。""",
-            
-            """### 3. 突出描述个股涨幅绩效视为违规！！
-**核心逻辑：**
-此规则用于打击**"无逻辑、无产品依托的纯战绩炫耀"**。
-**判定关键：**
-1.  是不是**"裸吹"**？（只说涨了，没说为什么涨，也没说是哪个工具选的）。
-2.  是不是**"为了卖弄而批量列举"**？（脱离服务语境，单纯堆砌3只以上暴涨股）。
-
-**重要原则：**
-**"产品/工具/策略的案例展示" ≠ "违规绩效炫耀"**。
-如果列举股票是为了证明**某个量化工具、模型、老师策略**的有效性，或者为了展示**服务产品的推送记录**，属于**产品功能介绍**，**一律合规**。
-
-**具体违规情形（满足以下任意一种即违规）：**
-
-**1. "裸描述"个股涨幅（无逻辑、无工具支撑）：**
-*   **定义：** 在描述个股时，**没有**结合选股逻辑（含策略名）、**没有**提及是由某工具/模型选出，**仅仅**强调其上涨的结果。
-*   *违规示例*："**三维通信再次大涨**，太牛了，好票提前分享。"（纯结果，无原因，违规）
-*   *违规示例*："11月28日【联特科技】**一路狂飘**！！"（只有形容词，违规）
-
-**2. "恶意批量晒单"（脱离服务语境）：**
-*   **定义：** 在**没有提及**任何服务产品、工具、策略名称的前提下，单纯罗列**3只或3只以上**股票的暴涨，营造"买了全赚"的假象。
-*   *违规示例*："昨晚给的票太神了，A票涨停，B票涨50%，C票涨40%。"（纯粹炫耀结果，违规）
-
-**3. 强调"连板/连阳"等高频暴利词汇（无技术分析）：**
-*   **定义：** 使用极具诱惑性的词汇描述个股的连续上涨形态，且无任何分析。
-*   *违规示例*："这只票已经**5连板**了"、"连续**收获3个涨停板**"。
-
-**绝对排除条款（以下情况一律不违规）：**
-
-**1. 【最高优先级】产品/工具/服务能力验证豁免（完美覆盖您的案例）：**
-*   **规则：** 只要提及股票是为了展示**"量化模型"、"选股工具"、"APP推送"、"实战班策略"、"老师实力"**的准确性或服务记录。
-*   *合规示例（工具验证）*："10.27日**黄金杯模型案例**——【中电港】入选后短线涨超20%"（这是展示模型能力，合规）。
-*   *合规示例（策略验证）*："解锁实战班**主力共振2号**策略...【利群股份】再次涨停"（这是展示策略有效性，合规）。
-
-**2. 包含广义选股逻辑/策略名称：**
-*   **规则：** 只要提到了**"为什么选这只票"**，无论是技术分析（均线、量能）还是**策略/战法名称**（如"主线+资金"、"政策共振"、"低吸入场"），均视为有逻辑。
-*   *合规示例*："专挑**主线+资金+政策共振**板块和个股"（提到了选股逻辑，合规）。
-*   *合规示例*："黄金杯工具捕捉**低位启动**机会"（提到了低位启动逻辑，合规）。
-
-**3. 对服务或老师的好评/反馈：**
-*   **规则：** 描述客户对老师技术的认可、对服务的满意度，或者老师的实力展示。
-*   *合规示例*："沈老师牛牛牛，实力反复验证"、"于大哥说不骗人"、"相信我们的服务不会让您失望"。
-
-**4. 只有代码/名称，没有描述涨幅结果：**
-*   *合规示例*："关注以下三只票：000001, 000002, 000003。"
-
-**最终判断逻辑（严格执行）：**
-1.  **第一步：看背景。**
-    *   是**"工具/模型/策略"**选出来的案例吗？是**"服务推送"**的记录吗？
-    *   列举了三只及三只以上的股票涨幅都算违规
-    *   如果是小于三只 → **直接判定合规**（无论涨幅多高）。
-2.  **第二步：找逻辑。**
-    *   是否提到了"资金"、"主线"、"低位"、"突破"或"某某战法"？
-    *   如果是 → **合规**。
-3.  **第三步：抓违规。**
-    *   既无工具背景，又无任何逻辑，单纯喊："XX票涨停了，XX票5连板了，XX票大涨了" → **违规**。""",
-            
-            """### 4. 对投研调研活动夸大宣传视为违规！！
-注意，只有员工明确强调线下调研后能获取一手资料、知根底、了如指掌，或明确强调联合调研了解机构真实持仓情况且股价受调研影响时才视为违规。""",
-            
-   """### 5. 向客户索要手机号视为违规
-
-【总原则】
-仅当客服“明确、直接要求客户提供手机号信息本身”时，才判定为违规。
-除明确索要外，任何说明、解释、确认、提醒、回访相关表述，均不得判定为违规。
-
----
-
-【判定为违规的唯一情形】
-客服主动向客户索取手机号内容，且目的在于获取该号码。
-
-典型违规话术包括但不限于：
-- “你电话号码报我一个”
-- “你手机号多少，发我一下”
-- “把你微信绑定的手机号给我”
-- “留个手机号我登记一下”
-
-判定特征：
-- 出现明确的索取指令（如：报、给、发我、提供、留一个）
-- 索取对象为手机号或电话号码本身
-
----
-
-【明确不构成违规的情形（禁止误判）】
-
-以下情况一律不视为“索要手机号”：
-
-1. 解释或说明回访电话机制
-包括但不限于：
-- 说明回访电话将拨打办理业务时使用的手机号
-- 说明系统、AI、OA、人工回访绑定的手机号规则
-- 说明微信支付、账号体系中已绑定的手机号
-
-示例（不违规）：
-- “它打的是你当时办理业务用的那个号”
-- “回访的是你微信绑定的手机号”
-- “系统会自动拨打对应的手机号”
-
----
-
-2. 确认接听电话的时间或便利性
-包括但不限于：
-- 询问客户什么时候接电话方便
-- 提醒客户注意接听某时间段或某前缀的来电
-- 说明该电话无需回拨或无法回拨
-
-示例（不违规）：
-- “你什么时候接电话方便”
-- “下午注意接听021开头的电话”
-- “这是AI自动回访，不用回拨这个电话”
-
----
-
-3. 客户主动提供或提出手机号相关安排
-包括但不限于：
-- 客户主动表示提供手机号
-- 客户提出回拨方案，客服仅作确认或解释
-
-只要客服未主动索要手机号内容，均不构成违规。
-
----
-
-4. 开户/实名认证流程中说明验证方式（核心排除，防误判）
-在开户、实名认证、绑卡等流程中，客服仅说明**客户本人用其手机号完成短信/验证码验证**的操作方式，不视为索要手机号。
-- 判定要点：表述的是“客户用自己手机号在系统/券商侧完成验证”，而非“把手机号报给、发给客服”。
-- 即便出现“点击/选择/勾选/确认/提交你自己的手机号”“点那串手机号”等**引导客户在开户链接页面完成验证步骤**的操作指令，只要没有要求客户把号码**提供给客服/用于登记**，一律不违规。
-- 仅当出现“报我/发我/给我/留给我/提供给我登记”等指向**客服获取号码本身**的索取指令时，才可能违规。
-示例（不违规）：
-- “你就用手机号短信验证就可以了”
-- “用你手机号收个验证码完成实名”
-- “在开户页面用手机号接收验证码”
-- “点击你自己的那串手机号/选择你自己的手机号，然后收验证码验证一下”
-- “他要验证您的手机号是不是本人，你点一下确认就行（在系统里完成验证）”
-
----
-
-【强制排除规则】
-- 未出现客服向客户索取手机号内容的，不得判定为违规
-- 涉及“回访”“系统自动拨打”“绑定手机号”等表述，默认视为业务说明
-- **开户/实名认证流程中“用手机号短信验证”“用手机号收验证码”等仅为验证方式说明，不视为索要手机号**
-- **开户页面引导客户“点击/选择/确认/提交你自己的手机号”以完成系统验证，不视为索要手机号（除非要求把号码提供给客服登记/发送给客服）**
-- 仅对“获取手机号信息”的明确行为进行违规判定
-
----
-
-【判定总结】
-索要手机号：客服主动要求客户提供手机号信息
-回访说明或接听安排：不属于索要手机号
-""",
- 
-            """### 6. 使用敏感词汇视为违规！！
-请你严格按照以下规则对用户输入的对话内容进行合规性检测。
-
-**核心逻辑：**
-判定分为两步：**第一步看"有没有说这个词"（命中）**，**第二步看"是不是承诺"（语境）**。
-- "抓到了一个涨停" -> 第一步**命中**（包含核心敏感结构） -> 第二步判断：如果是**过去式/事实**则合规。
-- "这只票必买，非常有潜力" -> 第一步**未命中**（"必买"不是结果承诺词） -> 直接**合规**。
-
----
-
-### **第一步：敏感词汇严格匹配（门槛判定）**
-**执行指令：**
-扫描文本，检查是否包含下方列表中的词汇或模式。**判定前先将句中插入的标点、分号、空格等忽略再与列表比对**（见E类）。
-- **未命中**：如果文本中**没有**出现列表中的任何一项，**直接输出"合规"**，严禁进入第二步。
-- **命中**：如果**命中**了列表中的词汇或模式，**必须进入第二步**进行语境定性。
-
-**匹配规则分类：**
-
-**E类：拆词/插入符号仍视为命中（防规避，最高优先级）：**
-*   若敏感词被**标点、分号、空格**等插入拆开，判定时**先忽略句中插入的标点与空格**再与列表比对，实质等同即**视为命中**。
-*   *示例*：`改变账；户`、`改变账，户`、`改 变 账 户`、`账！户` 均等价于 `改变账户`/`账户`，命中敏感词「改变账户」。`换成这种强势龙头股来改变账；户！如何？` → 命中「改变账户」。
-
-**A类：固定短语（必须字面完全连续，少一个字、多一个字都不行）**
-*   针对列表中的固定短语（如`吃肉行情`、`牛股`），文本必须完整连续包含。
-*   **特例防误判（关键）：**
-    - 列表词是`吃肉行情`，如果文本只有`吃肉` -> **不匹配**。
-    - 列表词是`牛股`，如果文本只有`牛`、`牛不牛`、`太牛了`、`大牛`（没带"股"字） -> **不匹配**。
-    - **"买票"专用规则：** 列表词是`进场买票`、`跟上买票`等。如果文本中仅出现`买票`、`打算买票吗`、`明天买票`，而没有前缀动词 -> **不匹配**。
-
-**B类：紧凑组合模式（允许中间插入少量字符）**
-*   针对 **"抓...涨停"** 这种动宾结构，允许中间插入 **0-3个** 字符（如"了"、"到"、"一个"）。
-*   **注意：** 此模式必须针对"个股"。如果描述的是大盘指数（如"指数封死涨停"），则不视为命中。
-
-**C类：可扩展词根（包含即匹配）**
-*   针对标记为【词根】的词（如`翻倍`），只要包含该二字即视为命中。
-
-**D类：白名单机制（最高优先级，强制清洗）**
-*   **黄金法则：** 凡是出现在下方的词汇或语境，无论语气多么强烈，只要没组成A/B类的特定死线短语（如"保证翻倍"），**一律视为不匹配，直接判定合规**：
-    *   **单词类：** 涨停、涨幅、上涨、大涨、赚钱、盈利、波幅、牛（如"牛不牛"）、必买、必跟、跟上、**买票（单独出现时）**、**买卖指导**。
-    *   **术语类：** 涨停因子、主升浪、突破、量价齐升、K线、资金流入、**反包**、**强势冲高**、**量化选股器**。
-    *   **大盘/外部预测类（重点）：** **指数X连阳（如8连阳/11连阳）**、**大盘/A股/市场将要上涨X%（特指针对指数的未来预测，包含具体数值如38%）**、**高盛/外围/第三方机构发布的预测数据**。
-    *   **营销语气类：** 所有的"后悔"、"错过不再"、"真的看好"、"务必买点"、"信我一次"、"机会难得"。
-
----
-
-### **第二步：语境定性（核心判决）**
-**仅在第一步确认"命中"敏感词后执行此步。**
-请分析该敏感词在句子中的**时态**、**对象**和**意图**：
-
-**1. 违规情形（面向未来的绝对性承诺）：**
-*   **具体结果承诺**：明确对**当下推荐的这只股票**的**未来**走势做出数字化或绝对化的保证。
-    *   *违规示例*："加入我们，带你**抓到了一个涨停**。"（承诺未来动作）
-    *   *违规示例*："明天这只票**翻倍**。"（对未来的结果定性）
-
-**2. 合规情形（事实陈述、类比、主观推荐）：**
-*   **既定事实/历史战绩**：描述已经发生的事情（如"纷纷强势冲高"、"今天反包大涨"、"昨天抓到了"）。
-*   **引用外部观点（关键豁免，最高权重）**：
-    *   **引用第三方知名机构（如高盛、大摩等）对"大盘"、"A股"或"指数"的预测（包含未来时态和具体百分比，例如"2026年将要继续上涨38%"），这属于客观资讯转述，不属于对个股的收益承诺，绝对判定为合规。**
-*   **类比与参考（关键豁免）**：提到敏感词（如"6个板"、"翻倍"），但主语是**另一只过去的股票**或**指数指标**。
-*   **日常问询与陪伴**：**询问客户"明天买票吗"、"打算买票吗"属于日常服务沟通，不属于营销诱导，判定为合规。**
-*   **空间描述**：描述个股"有7个点的空间"属于技术面分析中的压力位预测，而非收益保证，判定为合规。
-
----
-
-### **敏感词汇列表**
-
-**1. 紧凑组合模式（允许中间隔0-3个字）：**
-抓*涨停、抓*板、*天*板（注意：若描述历史参考票或大盘则豁免）
-
-**2. 可扩展词根（包含即匹配）：**
-预期收益【词根】、翻身【词根】、回血【词根】、回本【词根】、翻倍【词根】、翻番【词根】、暴涨【词根】
-
-**3. 固定短语（必须字面严格连续，尤其注意涨停相关，一般包含"涨停"的不违规）：**
-预期空间、进场买票、跟上买票、上车买票、安排做票、跟上操作、预期波幅、预期涨幅、吃肉行情、吃饭行情、捡钱行情、成功率*%、收益率*%、胜率*%、翻身仗、带您打翻身仗、妖龙、牛股、妖股、*天*个涨停、连续*个涨停、*字板、全胜、没有亏损、改变账户、吃大肉、吃肉喝汤、大赚小亏、大赚小赔、少赚就是亏、稳赚不赔、本金无忧、*战*胜、持续盈利、钱生钱、边学边赚、最快收盘见效、最快明天见效、立竿见影、票赚回服务费、赚回服务费、赚回学费、抓10倍股、搏一搏、单车变摩托、坐享财富增长、一天一辆小汽车、赚套大平层、一天一套房、翻蓓、翻身机会
-
----
-
-### **绝对排除条款（豁免金牌）**
-**判定前最后一道防线，只要符合以下任意一种情况，无条件判定【合规】：**
-
-1.  **事实/历史/他人描述**："**已经**涨停了"、"学员**已经获利**了"、"昨天**抓到了**涨停"。
-2.  **大盘/指数描述（含未来预测）**：提及"**指数连阳**"、"**大盘/A股将要上涨百分之多少（如38%）**"、"**预测3700点**"等。
-3.  **常规术语/技术面**："吃透主力"、"把握节奏"、"**涨停因子**"、"利好"、"**涨幅空间**"（注意：此处指个股振幅）、"冲击涨停"、"主升浪"、"突破"。
-4.  **强烈推荐/营销话术**：包含"**必买**"、"**必跟**"、"**不要错过**"、"**后悔**"、"**真的**"、"**务必**"。
-5.  **日常服务对话**：包含"**买票吗**"、"**有操作方向吗**"、"**选股器指标**"、"**有合同发票**"、"**售后有保障**"。""",
-            
-            """### 7. 异常开户视为违规！！
-注意，只有特定券商名称结合最低佣金/佣金优惠及加微信等诱导开户行为才视为违规。""",
-            
-
-"""### 8. 干扰风险测评独立性视为违规！！
-注意，只有**直接告知客户具体选项（包括肯定式"选A"和否定式"别选A"）、为了通过测评而教唆客户修改答案、或诱导客户做出不符合实际情况的选择**时才视为违规。
-
-**【最高优先级判定：流程提醒与风险教育豁免】**
-**在判定前，请首先执行以下豁免逻辑。以下行为旨在确保测评的真实性和严肃性，或属于正常服务陪伴，一律视为合规：**
-
-1.  **流程性提醒与操作协助**：仅提醒客户"注意看题"、"重新测评时仔细一点"、"显示重新测评了吗"、"有两个题目要注意一下（未指定具体怎么选）"。**包括：支付引导（如“付好了跟我说一下”）、进度确认（如“操作到最后截图给我”）、为客户读题、解释题目字面意思、指导如何缩小窗口等操作。**
-2.  **风险教育与逻辑引导（强化防误判）**：向客户解释投资的客观现实与门槛。**包括：告知“股市有波动，哪怕1%的波动也是风险”、“不具备风险承受能力无法合作/无法开户”。允许通过逻辑常识引导客户认真对待，如“您既然进股市/曾经成功开过户，应当具备基本的风险认知”、“若不能承受波动则无法在股市成功”。此类基于市场规律、过往经验或投资目标的客观教育，旨在纠正客户因粗心或误解导致的“零风险”极端选择，属于合法风险提示，一律判定为【合规】。**
-3.  **非指向性建议与非关键信息容错**：引导客户**"根据实际情况填写"、"只要不空着就行"**。针对不影响风险等级结论的流程性动作/非关键字段（如地址、职业），为了完成流程提及**"随便选一个"、"选哪个都行"、"没有固定答案"**时，默认视为口语化表达，**一律合规**。
-    - **（重要区分：若引导在【姓名、身份证号】上造假，判定为【违规】；但若在【地址、职业】等非核心字段上指导“随便填”、“不留白即可”，则判定为【合规】）。**
-4.  **进度与结果确认**：仅询问是否完成测评、是否生成分数、是否点击支付。**如：“付了198跟我说一下，我去安排服务”、“签署完成到这个页面告诉我”。只要不涉及指定答案，此类推进流程的话术一律【合规】。**
-
-**核心判定标准：**
-行为目的是**为了规避风控限制，引导客户填写虚假【身份信息】或指定测评答案**。
-
-**具体违规情形（明确的诱导/教唆/造假）：**
-- "这一题你要选C才能过" / "年收入那栏你选最高那个"
-- "风险承受能力要填高一点，不然买不了" / "为了通过，你把那一项改成'激进型'"
-- **教唆伪造核心身份信息**：**"身份证号码你随便填一个"**、**"名字随便写"**。
-- **监控式/施压式陪同**：**"我带着你做，选一个告诉我一个"**、**"你回答我一下你选了什么"**（逐题汇报）。
-- **排除法/否定指令**：**"这个选项肯定不要选"**、**"这一项不符合咱们投资目标，别点它"**。
-
-**绝对合规内容（以下一律不视为违规）：**
-- **引导正视风险**：**“股价波动一个点也是风险，您如果一点都不能承受，那肯定不能成功”**（属于客观风险教育）。
-- **引用既往事实**：**“您之前成功开过户，应该是可以（通过测评）的，再重新明确下目的做一下”**（属于基于事实的鼓励，未指明具体答案）。
-- **支付与服务对接**：**“付好了给我说，我去给您安排服务，体验量化模型”**（属于正常业务流程）。
-- **所有模糊提醒**：**“注意一下题目”**、**“重新测评一下”**。
-- **关于非核心信息的容错引导**：**“地址职业随便选一个，不留白就行”**。
-
-**判断逻辑（案例对齐）：**
-1.  **案例 A**："要重新测评一下，有两个题目，注意一下" → **合规**。
-2.  **案例 B（针对性补丁）**："波动一个点也叫风险，您要是一个点都不能承受，那肯定不能成功。您之前成功开户过，说明您可以，再明确下目的重新做一下" → **合规**。理由：属于**风险常识教育与过往身份确认**，未指定具体题目及选项。
-3.  **案例 C**："除了姓名身份证必须真实，地址和职业随便填一个就行，不空白就好" → **合规**。
-4.  **案例 D**："第3题选A，不然评测等级不够" → **违规**。
-5.  **案例 E**："这一项是没风险意识，咱们投资肯定有意识，所以这个肯定不要选" → **违规**。理由：使用了否定式指令限制了具体题目的选择。
-6.  **案例 F**："付好了给我说一下，办理好就可以体验模型了" → **合规**。理由：属于正常的业务办理跟进。
-
-**强制指令：**
-- **严禁将“风险教育逻辑”判定为“施加心理压力”。** 告知“不承受风险就无法成功”是投资界的客观事实，旨在让客户审慎测评，不属于违规诱导。
-- **严禁将“引用开户经验”判定为“诱导作答”。** 只要没有说“因为你开过户，所以第X题必须选C”，仅作为重新测评的鼓励话术，必须判定为**合规**。
-- **严禁将“流程推进/支付确认”话术判定为干扰测评。**
-- **判定违规的唯一红线是：是否指向了具体选项（选哪个/不选哪个）或教唆伪造核心身份。**
-""",
-            
-            
-"""### 9. 错误表述服务合同生效起始周期视为违规！！
-注意，只有**错误表述服务合同期起始时间，涉及虚假或误导性承诺**时才视为违规。
-
-**核心判定标准：**
-行为涉及**将客户已购买的合同服务期的起始日，错误地表述为晚于实际购买日的某个未来日期**，从而缩短客户实际享受的服务时长。
-
-**具体违规情形（错误表述已付费服务期）：**
-- "您购买的半年服务，**合同期从下周开始计算**"
-- "虽然今天付款，但**服务期从明天才开始**" 
-- "合同上写的是半年，但**实际服务时间从周一开始算**"
-- **"下周一开始算时间"（将客户今天购买的服务的起始日错误指定为下周一）**
-- **其他明确指定合同生效起始时间，且该时间晚于客户实际付费时间的表述**
-
-**绝对合规内容（以下一律不视为违规）：**
-- **服务合同生效起始时间从客户实际办理完成的当天开始计算（这是标准做法）**
-- **明确告知客户，在其购买的服务期基础上，将额外赠送一段免费服务期（如"额外赠送的一个月时间我会在线下给您添加上的"）**
-- **合同中关于服务时长的准确说明**
-- **营销话术、邀约表述中不涉及具体合同起始时间的内容**
-- **关于优惠截止时间、活动期限的表述（如"活动今晚12点结束"）**
-- **【新增】解释合同显示周期与实际总服务周期不一致的情况（如“合同写的是183天，但我额外送您212天，总共13个月”）**
-- **【新增】告知具体的策略推送、软件功能更新、数据发布时间（如“明天早上10点会推送策略”）**
-- **【新增】强调营销活动稀缺性或赠送截止时间的话术（如“明天就没有这13个月的服务优惠了”）**
-
-**易误判场景特别排除（关键修正点）：**
-1.  **区分“服务起始”与“功能/策略时间”：**
-    *   如果话术是告知客户**某个具体功能、选股策略、数据更新**的时间点（例如：“明天上午您打开软件，10点左右策略会推送出来”），这是产品使用指导，**完全合规**。
-    *   **判定逻辑：** 只有说“合同/服务期限”从明天开始才违规，说“策略/数据”从明天开始不违规。
-
-2.  **区分“推迟服务生效”与“活动优惠截止”：**
-    *   如果话术是强调**如果不现在买，明天就没有这个优惠了**（例如：“明天真的没有13个月的服务了，如果有我自己买一个给你”），这是强调活动稀缺性，**完全合规**。
-    *   **判定逻辑：** 语境是催单、强调机会稍纵即逝，而非定义服务合同的生效日。
-
-3.  **区分“合同书面日期”与“实际总有效期”：**
-    *   如果话术是在解释**合同面额时间与实际到手时间（含赠送）的差异**（例如：“合同写的半年，但是有效期给您加到了13个月”），这是明确赠送行为，**完全合规**。
-
-**重要说明：**
-- **"额外赠送的一个月时间我会在线下给您添加上的"属于增值服务赠送，明确区分了合同期与赠送期，是透明、诚信的行为，不违规。**
-- 任何将客户**已付费的服务合同起始时间**推迟到未来某个具体日期的表述都视为违规，因为这涉嫌侵占客户已购服务的时间。
-- 但**在已付费服务期之外，明确增加免费的赠送期**，是对客户的额外优惠，不视为违规。
-- 只有明确指定具体的合同起始时间**且该时间晚于办理时间**才构成违规。
-
-**最终判断逻辑：**
-- **如果** 表述的是**合同载明的、客户付费购买的**服务期的起始日，且该起始日晚于付款日 → **违规**。
-- **如果** 表述的是**在合同服务期之外额外赠送**的服务时间（含解释合同显示与实际所得差异） → **合规**。
-- **如果** 表述的是标准规则（如"合同从付款当日生效"）或未涉及具体起始日 → **合规**。
-- **如果** 提及的未来时间点是**策略推送时间、软件功能开启时间、活动结束时间**，而非服务合同生效时间 → **合规**。""",
-            
-            """### 10. 不文明用语视为违规！！
-注意，只有使用具有侮辱、讽刺、歧视或攻击性内容的语言时才视为违规。
-
-**具体违规情形：**
-- 使用侮辱性词汇（如"傻逼"、"脑残"、"穷鬼"等）
-- 对客户进行人身攻击或讽刺性嘲笑
-- 使用粗俗语、骂人词汇、带有明显贬义的称呼
-- 其他具有攻击性、歧视性的语言
-
-**重要说明：**
-- 营销话术、邀约表述不视为不文明用语
-- 强调性表述（如"务必要重视"）属于正常沟通，不视为违规
-- 情感表达（如"信心十足"）属于正常业务沟通，不视为违规
-- 只有明确出现侮辱、攻击、歧视性内容才构成违规
-- "骗子"以及相关词汇不视为不文明用语""",
-            
-            """### 11. 以退款为营销卖点视为违规！！
-注意，只有**在营销过程中，主动以"退款/退费/退钱"作为服务优势或承诺来吸引客户购买**时才视为违规。
-
-**【新增核心原则（修正版）】**
-1. **正式服务费/合同条款的死线：** 即使是在回答客户问题时，一旦服务方主动提及**正式合同/全额服务费**的具体退款天数（如"3天"、"5天"）或明确的"无理由/不满意"退款条件，视为违规。
-2. **【定金/订金/小额占位费特权】：** **必须严格区分"定金"与"尾款/服务费"。**
-   - **定金/订金**（通常金额较小，如1000元）：为了降低客户决策门槛，**允许**承诺"不满意"、"不想办了"、"觉得不行"退还**定金**。**此类针对定金的"试用"、"体验"、"冷静期"描述，一律合规。**
-   - **尾款/正式服务费**：**严禁**承诺"正式办理后，效果不好退还**服务费**"。
-
-**核心判定标准：**
-必须是**服务方在邀约或推销过程中，主动提出的、无条件的或宽松的退款承诺**，以此作为促使客户决策的卖点。**或，在沟通中主动将退款承诺具体化。**
-
-**具体违规情形（营销场景下主动承诺）：**
-- **针对正式服务/全额付款：** "**购买后**不满意随时退款"
-- **针对正式服务/全额付款：** "**加入我们**不赚钱就退费"
-- **针对正式服务/全额付款：** "**效果不好**全额退款"
-- **针对正式服务/全额付款：** "**达不到预期**就退钱"
-- **明确告知客户退款方案（5天无理由退款）或不满意随时提，不满意来找我**
-- "**放心办**，不好用给你退"（暗示正式服务可退）
-- **"先交定金试票，做的不好/票没涨/亏损了，定金随时退"**（**注意：若此处语境暗示的是"验证结果"，且引导客户认为这是一种对赌，仍需谨慎；但如果强调的是"体验期满意度"，则参考下文豁免**）
-- **【新增】在沟通中（包括回答客户提问时），主动提及具体的退款天数或明确条件**（如"合同写的是5天无理由退"、"我们是7天无理由退款" —— **特指正式合同条款**）
-
-**绝对合规内容（以下一律不视为违规）：**
-- **【定金豁免专区】所有针对"定金/订金"的"后悔药"机制：**
-    - **"先交定金锁定名额/优惠，后续不想办了/不需要了/资金不足，定金随时退/原路退。"**
-    - **"交定金体验/试看/跟老师聊几天，如果觉得满意再补尾款，觉得不满意/不行，定金全退。"（包含具体的体验天数如"5天体验"也合规）**
-    - **提及定金退款的自动流程（如"定金15天自动退回"、"一分不扣"）。**
-- **在客户询问或质疑时，对退款政策的解释说明**（**仅限于模糊回应，如"有合同保障"、"可以查看合同"，不得提及具体天数**）
-- **在售后服务或纠纷处理中，提及退款流程或协议**
-- **提醒或询问客户关于退款协议的签署进度（如"你签好退款协议了吗？"）**
-- **合同中关于退款条款的例行告知**（**指引导客户阅读合同文本，而非直接告知具体条款内容**）
-- **所有非主动营销性质的、涉及退款的后端服务沟通**
-- **保证最低价**
-- **"先交定金把优惠/名额锁定住，如果后续资金不凑手/有其他安排/补不了尾款，定金是可以退的"**
-- **我为你负责到底**
-
-**重要说明：**
-- **"你签好退款协议了吗？"属于服务跟进或流程确认，是响应或处理行为，不是主动营销，不违规。**
-- **只有为了促成交易而主动做出的、吸引眼球的退款承诺，才构成违规。**
-- **被动响应客户关于退款的疑问，或处理已发生的退款申请，是正常的客户服务，不违规。**
-- **【新增】客户问"几天能退？"，回答"合同里有写"或"您看一下合同"是合规的；但回答"合同写的是5天"是违规的。**
-- **【新增定金特判逻辑】：**
-    - 话术涉及**"定金"** + **"体验/试用/满意度"** + **"不满意退定金"** → **合规**（视为售前体验流程）。
-    - 话术涉及**"正式服务费/尾款"** + **"效果/收益"** + **"做不到退全款"** → **违规**（视为违规承诺）。
-
-**强制指令（调整顺序）：**
-1.  **第一步：识别资金对象（定金 vs 尾款）**。
-    - 如果讨论的是**"定金"、"订金"、"诚意金"**，且承诺的退款范围**仅限于该笔定金** → **直接判定为合规**（允许提及"体验不满意退定金"、"15天自动退"等）。
-2.  **第二步：检查是否提及具体天数/条件（针对正式合同）**。
-    - 如果未涉及定金，而是直接谈论**正式合同**，且提到了**具体的退款天数（数字+天）或明确条件**（如"无理由"、"不满意就退"）→ **直接判定为违规**。
-3.  **第三步：判断语境**。
-    - 如果是**营销推广、邀约购买**，且主动提及**正式服务费**的退款作为卖点 → 可能违规。
-4.  **第四步**：如果对话是**客户服务、售后跟进、协议处理**，且仅模糊提及退款 → 一律不违规。""",
-            
-            """### 12. 怂恿客户使用他人身份办理服务视为违规！！
-注意，只有引导客户使用他人身份购买办理服务时才视为违规。
-
-**具体违规情形（必须字面完全匹配以下表述）：**
-- "可以用家人的身份办理"
-- "找朋友借身份来开户"
-- "使用他人名义购买服务"
-- 提供具体他人身份信息指导
-- 其他字面明确引导使用第三方身份的表述
-
-**绝对禁止事项：**
-- **严禁进行"结合上下文"的判断**
-- **严禁进行"可能存在暗示"的推断**
-- **严禁将名额限制解读为使用他人身份**
-- **严禁将回复指引解读为使用他人身份**
-- **严禁将任何营销话术关联到使用他人身份**
-
-**绝对合规内容（以下一律不违规）：**
-- "回复【888】"、"速回【数字】"等任何回复指引
-- "名额不多了"、"名额有限"等任何名额描述
-- "抢占优惠"、"申请最低价"等任何营销话术
-- "小资金帮扶"等任何服务描述
-- 所有不字面提及使用他人身份的表述
-- 这是XX的身份证
-
-**最终判断标准：**
-- **只有字面明确出现"使用他人身份"相关表述才违规**
-- **所有其他情况一律合规**
-- **禁止任何形式的推断和联想**""",
-            
-
-
-"""### 13. 违规指导视为违规！！
-注意，**严禁员工以个人名义**向客户提供诊股建议或操作建议。只有引用投顾老师、官方策略、APP指标的观点才算合规。**员工个人的技术面分析（如看趋势、看压力位）等同于违规指导**。
-
-**【最高优先级指令：合规豁免"三张金牌"】**
-**判定第一步：只要文本符合以下任意一种情况（满足任意一张金牌），直接判定【合规】，无需检测后续内容：**
-
-**金牌 A：标准化投顾服务交付（执业证明）**
-*   **判定规则：** 文本中包含了 **"投资顾问执业编号"**（如 `A024...`） **且** 包含了 **"风险提示/免责声明"**。
-
-**金牌 B：引用官方/老师/软件/他方观点（传声筒/信号解读/角色引导/服务关怀）**
-*   **判定规则：** 文本明确表明观点或操作建议来源于**第三方权威**，或属于**客服性质的服务承诺/流程指引**。
-*   **关键标识（扩充版）：** 
-    1.  **搬运观点（含读屏分析）**："**XX老师说/建议**"、"**软件/指标/解套王显示/魔方软件显示**"（只要有此前提，后续出现“止盈止损、洗盘、压力位”等术语均合规）、"**根据策略显示的价格/调入区间**"。
-    2.  **角色转接与团队服务（核心豁免 - 重点）**：
-        *   员工告知客户“**具体操作由老师/特助/助教负责**”、“**有问题去问助教老师**”、“**等下老师会教你怎么做**”、“**他比我专业，让他帮你分析**”。
-        *   **双人/团队服务描述**："**我和高级助教一起服务您**"、"**以后我们两个/仨一起服务您**"、"**添加特助微信，让他带您开通/给您代码**"。
-        *   **能力免责**："**我只是助理/客服，不能明确知道买卖/水平没老师高，具体看软件/问老师**"。
-    3.  **服务承诺与中转（新增补丁）**："**买了票跟我说一声，我帮你看/帮你盯着/帮你关注**"、"**好的/没问题**"（回应客户求助时）、"**发给我，我帮你提交给老师诊断**"、"**我帮你问问老师/帮你安排**"、"**教您查看内部操作提示**"（此话术定义为**售后服务关怀/操作指引**，非违规诊股）。
-    4.  **客观状态与风险提示**：提及老师的作用是“**帮您规避风险**”、“**提示止盈止损**”、“**老师/模型预测了大盘下跌/优选强势股**”是对老师服务能力的描述。
-
-**金牌 C：服务模式、产品功能介绍与软件操作指引（功能、教学与合规流程）**
-*   **判定规则：** 文本在解释产品包含什么服务，**教客户如何使用工具/方法**，或进行**业务办理**。
-*   **典型表述（扩充版）：** 
-    1.  **软件路径与参考指引**：指导客户点击软件模块。例如：“**点击研选量投**”、“**点开这个检测网**看个股分析”、“**可以按照这个参考区间/调入区间做参考**”、“**教你怎么看票/看买卖区间**”。
-    2.  **服务内容描述**："内部服务会**由特助通知买卖区间**"、"跟着老师指令做就行"、"**会有老师帮你盯盘/做规划**"、"每天会推送策略精选"、"**直接的代码加买卖区间的内部量化策略**"。
-    3.  **方法论、策略逻辑与功能教学（针对案例 8, 10, 16）**：
-        *   提及"**高抛低吸**"、"**做T**"、"**规避风险/止盈止损**"、"**先手吃后手**"时，如果是为了**介绍服务作用、解释策略原理**（如：“*尾盘买明天卖，到了止盈区间就操作*”这种**假设性/逻辑性描述**），而非针对某只具体股票下达即时指令，判定为合规。
-    4.  **业务办理与合规流程**：提及**对公账户、合同签署、发票、风险测评、监管规定、合同样办、实名认证、添加微信/点击链接**等流程。
-
----
-
-**【次级优先级：营销、心态与案例】**
-**如果未命中上述金牌，再看是否为以下情况（均判定为合规）：**
-1.  **营销话术/诱饵（针对案例 4, 11, 17）**：为了引导测试实力或福利领取的非指令性话术。
-    *   **特征**："**可以买个一两手验证下实力**"、"**拿个小仓位试一试/小资金小仓位**"、"**建议观望/不要盲目操作/不建议盲目追涨**"、"**盘中低位推荐/不追高**"、"**高位进肯定有风险/空间有限**"、"**股价高就少买点**"、"**跟上主力抢**"。
-2.  **战绩/案例展示**：展示过去的战绩（"之前老师给的票赚了"、"上周买的"）或展示软件界面截图。
-3.  **心态建设/心理按摩（针对案例 9, 13, 20）**：劝导客户心态放平，如"**涨了不骄跌了不焦**"、"**要执行力强/相信专业**"、"**忌贪**"、"**心态放好**"、"**不能着急/不要随便抛售**"（语境为安抚情绪并引导咨询老师，而非阻挠交易）。
-
----
-
-**【违规判定核心标准（严打"个人口吻"与"瞎指挥"）】**
-**只有在上述所有豁免均失效的情况下，且命中以下任意一种情形，即判违规：**
-
-**情形一：具体的买卖持仓指令（脱离官方口吻，员工直接下令）**
-*   **关键词**：买入、卖出、**持有**、**拿住**、**减仓**、清仓、割肉、止损、**回本出**、**做T**、**换股**、**调仓**。
-*   **违规案例特征**：
-    *   "**我觉得**这个票你先拿住不要动"（无背景来源的个人指令）。
-    *   "**我建议**你明天回本就走"（个人私自下令）。
-*   **（重要排除项 - 严防误判）：** 
-    1. 如果上述关键词出现在**介绍软件功能/策略逻辑**（如"软件显示买卖区间"、"策略就是今天买明天卖"）、**服务承诺**（如"老师会带你规避风险/止盈"、"教您查看买卖区间"）中，**不算违规**。
-    2. 如果出现“**我教你/我帮你**”+“**看/盯/安排/提交**”，即使上下文有股票讨论，视为服务流程，**不算违规**。
-
-**情形二：员工个人的技术面/基本面"诊股"（主观分析）**
-*   **判定核心**：员工**撇开软件/老师**，直接以**个人口吻**对股票走势进行主观定性。
-*   **违规关键词**：**下跌通道**、**没止跌**、**下行趋势**、**压力位**、**支撑位**、**资金合力**、**主力**、**该调了**。
-*   **违规案例特征**：
-    *   "我看了一下，这个票**资金合力不行**"（无来源的个人分析）。
-    *   "现在是**下行趋势**，还没有止跌迹象"（私自定性，且未提及软件/指标）。
-*   **（重要排除项 - 防误判）：** 
-    1. 员工说"**我帮你看/帮你盯着/帮你提交给老师**"但**没有**后续具体的点位分析或走势定性，视为服务客套，**不算违规**。
-    2. 员工说"**我看了一下**" + "**指标显示/魔方显示/检测网显示...**"，视为引用工具，**不算违规**。
-    3. 员工使用**常识性/建议性描述**（如"有触底反弹迹象，可以看看后期走势"、"好票拿不住"）且**目的是为了引导客户使用产品或咨询老师**，而非直接下达交易指令，视为**合规**。
-
-**判定公式（修正强化版）：**
-*   (具体建议) + **(老师负责/找助教看/等通知/他比我专业/我们一起服务)** = **合规** (角色引导)
-*   (分析结果/专业术语) + **(看诊断二维码/APP显示/魔方软件显示/策略逻辑)** = **合规** (工具引用/教学)
-*   (我帮你看/帮你盯/帮你提交/好的没问题) + **(无具体点位分析/引导加微信)** = **合规** (服务承诺)
-*   (止盈止损/做T/规避风险) + **(介绍老师作用/指标功能/参考区间)** = **合规** (功能教学)
-*   (通用原则) + **(低位推荐/不追高/观望为主/小资金)** = **合规** (营销/风险教育)
-*   **只有：(买卖指令/趋势分析) + (员工个人口吻且无任何来源背书)** = **违规**
-
-**最终判断逻辑（严格执行）：**
-1.  **先看来源与场景**：是否有"老师/助教/软件/指标"背书？是否在"教下载/点击模块/让加微信/承诺帮忙提交/安抚情绪/开通权限"？是否有“我只是助理/我们一起服务”的免责？如果有 -> **合规**。
-2.  **看“分析”的归属**：是单纯的"我帮你盯着/我帮你提交"（合规），还是引用软件提示“参考买卖区间”（合规），还是解释“策略是今天买明天卖”（合规），还是完全个人口吻说“这个票不行”（违规）？
-3.  **抓纯私货**：只有员工直接对个股下达持仓指令或做技术分析，且**未明确指引**客户看软件、看检测网或咨询老师，才判定为**违规**。""",
-            
-
-
-            """### 14. 将具体股票策略接入权限作为即时办理卖点视为违规！！
-注意：在营销过程中，将客户付费开通服务与获取某个具体股票或投资策略在特定时间窗口内的操作权限直接绑定时，视为违规。
-
-**【最高优先级指令：诱饵式营销与服务落脚点豁免】**
-**在判定前，请首先检查文本的"落脚点"（最终目的）。**
-如果营销话术使用了当下的热点、信号或机会作为**"诱饵"**，但最终引导客户付费的目的是**"解锁服务"、"享受精选服务"、"开通权限"、"办理实战班"**，则一律判定为**合规的营销包装**。
-**判定口诀：**
-- "付钱，买这只票的操作权" → **违规**（单次售卖）。
-- "付钱，解锁包含这只票在内的整体服务" → **合规**（服务推广）。
-
-核心判定标准（必须同时满足）：
-1.  **对象具体化**：明确提及或强烈暗示一个具体的买入目标。
-2.  **时机紧迫化**：使用"明日出击"、"尾盘统一建仓"、"这只票必买","这只票必跟"等词营造紧迫感。
-3.  **权限商品化（关键）：** 将付费直接定义为获取"单次操作"的交换。
-    *   **【豁免】**：如果话术强调的是**"解锁服务"、"享受服务"、"办理业务"**，即使提到了具体的信号，也视为**服务权益的交付**，而非单次售卖。
-
-具体违规情形（纯粹的单次机会售卖）：
-- "**【共振擒龙1号】明日盘中只有少量买入时间**，**帮你申请个最低价办理跟上**吧？？"
-- "**尾盘【案例精选】**...直接给到您代码+买卖区间...**现在办理好**，#直接把代码+买卖价格区间发你"（这里强调的是发代码，而不是开通服务）
-- "**跨年龙《共振跟投1号》尾盘所有特训营学员统一建仓了**，您这边能**办理解锁跟上**吗？"（这里的解锁跟上特指跟上这一次建仓）
-
-合规内容（以下一律不视为违规）：
-- **所有"服务解锁类"话术（包含诱饵）**：
-    - **【典型案例】**："快，有2000空仓位吗？...㊙现发出突破信号...有【代码+买卖价格区间】198办理，**直接解锁享受精选服务方便**，速回'1'"。
-    - **解析**：虽然有"快"、"信号"等紧迫词，但落脚点是"解锁享受精选服务"，且198元通常为体验课/服务费，属于合规的服务推广。
-- **所有"互动询问类"营销模版**：如"回复【6】：想要今天老师亲选主力强龙...多少解锁沈老师带队服务？"。
-- **仅描述服务模式**："我们的服务包含提供代码和买卖区间。"
-- **将策略名称作为产品展示**：如"技术共振2号"，并引导客户加入"特训营"或"战队"来获取。
-- **"每天都有【模型选股精选案例】"**：属于对持续性服务内容的描述。
-
-重要说明：
-- **本质是"售卖单次操作资格"**：此规则禁止的是将投顾服务异化为"为某次具体投资操作付费"的行为。
-- **判定心法（修正版）**：
-    - 文本强调的是**"解锁服务"**（Unlock Service）？ → **合规**（即使服务里包含当下的票）。
-    - 文本强调的是**"买这个代码"**（Buy Code）？ → **违规**。
-- **关于"同款模型/信号"**：提及"和上面XX同款量化模型筛选，现发出突破信号"，这是在证明**服务能力的稳定性**（以前准，现在也准），以此吸引客户办理服务，**合规**。
-
-**强制执行逻辑：**
-1.  扫描文本末尾的引导动作。
-2.  如果是"解锁服务"、"享受服务"、"办理体验"，无论前半段多么紧迫，**一律合规**。
-3.  只有当引导动作纯粹是"为了拿到这个代码而付费"时，才判违规。""",
-            
-            """### 15. 虚假宣传案例精选及人工推票视为违规！！
-**核心逻辑：**
-此规则专门用于打击**用已下线的"老版本服务模式"忽悠客户**的行为。
-**现状事实：** "案例精选"栏目对新客户已隐藏，现改为"股池"模式；**不再提供**老师二次复筛、**不再提供**微信推送提醒、**不再提供**明确买卖区间、**不再固定**每日"一主一创/每日两只"。
-**判定关键：** 凡是向客户承诺**"不用自己选（老师帮你筛）"**、**"固定推送数量/搭配（如一主一创）"**、**"微信直接发买卖点"**或**"引导去找案例精选栏目"**的，均为违规。
-
-**具体违规情形（必须字面匹配以下"已下线"的特征）：**
-
-**1. 承诺"老师人工二次复筛"（违背"客户自选"原则）：**
-*   **违规点：** 谎称有老师在模型基础上再进行人工精选，让客户"不用费心"。
-*   *违规示例*："每天内部模型选股+**老师人工二次精选**"
-*   *违规示例*："由**投研老师**结合市场热点**优中选优**给到您"
-*   *违规示例*："**不用您去费心选股了**！只需按照提示操作"
-*   *违规示例*："虽然没有案例精选了，但**老师还是会帮你单独挑出来**"（虚假承诺）
-
-**2. 承诺具体的"推送数量与板块搭配"（违背"股池"原则）：**
-*   **违规点：** 使用老版本的固定搭配话术，强调数量和板块的确定性。
-*   *违规示例*："给到您**1到2支票**，**一只主板，一只创业板**"
-*   *违规示例*："**每次两只**，搭配一个科创板或创业板"
-*   *违规示例*："**一天推送四只**，根据行情来定"
-*   *违规示例*："**一次只提示1-2支**，建议做完一只再做下一只"
-
-**3. 承诺"微信推送"与"具体买卖指导"（违背"无提示"原则）：**
-*   **违规点：** 承诺将代码和价格直接推送到微信，或承诺给具体的买卖区间。
-*   *违规示例*："老师每天**微信上给您推送**，有具体的**买卖区间提示**"
-*   *违规示例*："直接给您代码，**给到明确的【买入区间】和【卖出区间】**"
-*   *违规示例*："**微信推送**，短线操作不墨迹"
-*   *违规示例*："**微信人工盯盘或提示指导操作**，有问必答"（注：若语境是承诺通过微信发股票代码和买卖点，则违规）
-
-**4. 引导寻找已下线的入口：**
-*   *违规示例*："登录好之后，**首页上方有个【案例精选】**"
-*   *违规示例*："您去看那个**案例精选栏目**"
-
-**绝对合规内容（以下描述符合"新版本"现状，一律不违规）：**
-
-**1. 提及"股池"与"自主查看"：**
-*   *合规示例*："加入后您可以去**内部股池**查看。"
-*   *合规示例*："我们提供模型选股结果，需要**您自己去池子里选**。"
-*   *合规示例*："您可以参考我们的**选股模型**，自己把握机会。"
-
-**2. 提及"无人工干预/无推送"的客观描述（实话实说）：**
-*   *合规示例*："现在都是模型自动选股，**没有老师人为干预了**。"
-*   *合规示例*："需要您登录软件自己看，**微信上不推票了**。"
-*   *合规示例*："现在不分主板创业板了，都在池子里。"
-
-**3. 仅展示历史战绩（不承诺未来服务模式）：**
-*   *合规示例*："之前案例精选选出的【航天电子】涨得很好。"（仅陈述历史选股能力，未承诺现在还给具体的票，合规）。
-
-**最终判断逻辑（精准打击）：**
-1.  **第一步：抓特征词。**
-    *   有没有提到 **"一主一创"**、**"一只主板一只创业板"**、**"每天两只/四只"**？ -> **有则直接违规**（这是最明显的老版本特征）。
-2.  **第二步：看服务承诺。**
-    *   有没有说 **"老师二次精选"**、**"不用自己选"**？ -> **有则违规**。
-    *   有没有说 **"微信推送代码"**、**"给买卖区间"**？ -> **有则违规**。
-    *   有没有引导去找 **"案例精选"**？ -> **有则违规**。
-3.  **第三步：放行合规。**
-    *   如果是让客户 **"去股池看"**、**"模型选股"**、**"自己选"**、**"无人工干预"** -> **合规**。"""
-            ,
-
-            """### 16. 冒用沈杨老师名义视为违规
-
-**核心逻辑：**
-2.0 产品的票是投研团队其他老师提供的，营销或服务沟通中**不得**描述为“沈杨老师本人亲自给票/亲选/亲自带队/亲自通知/亲自推送/亲自陪伴买卖提醒”等，否则视为**冒用沈杨老师个人名义**进行宣传，判定为违规。
-
-**违规判定条件（满足任意一项即违规）：**
-- 出现“沈杨老师亲选 / 沈杨老师亲自给票 / 沈杨老师亲自带队 / 沈杨老师亲自通知 / 沈杨老师亲自推送 / 沈杨老师亲自全程陪伴”等同义表述，且语境明确指向 2.0 产品服务。
-- 将策略/共振股/真龙/擒龙等具体票或策略，明确归因于“沈杨老师本人亲自挑选/亲自下发/亲自提醒买卖”。
-
-**绝对合规表述（以下一律合规）：**
-- 可以描述为“沈老师投研团 / 沈老师团队 / 沈老师团队的老师 / 投研团队”给到的票或策略。
-- 可以说“老师团队带队/陪伴/服务”，但不得把“亲自给票/亲选/亲自通知”落到沈杨老师个人身上。
-
-**最终判决要点：**
-- 看到“沈杨老师亲选/亲自”这类归因表达，且明确是 2.0 产品 → **违规**（触发事件：冒用沈杨老师名义）。
-- 仅出现“沈老师团队/投研团”且未把给票归因到沈杨老师个人 → **合规**。
-"""
-            ,
-
-            """### 17. 收受客户礼品视为违规
-
-**核心逻辑：**
-员工/服务方在与客户沟通中，出现**收受、索要、暗示收受**客户礼品、红包或请客招待（含“到你城市你请客/赚钱请我吃饭”等）属于违规。
-
-**关键词与语境识别（必须结合语境）：**
-仅当关键词出现在“客户给员工/服务方送礼或员工暗示/要求客户送礼”的语境中才判违规。常见关键词包括：
-礼物、红包、赠送、收受、寄给您、（给我）寄个东西、一点心意、寄点特产、一点小意思、请我吃饭、你请客、到你的城市玩你请客。
-
-**具体违规情形（满足任意一种即违规）：**
-- 员工明确表示要收/愿意收客户礼物或红包：如“给我发个红包”“红包就不用了/给我来个红包”“礼物寄给我就行”。
-- 员工引导客户以请客/招待作为回报：如“赚钱了请我吃饭”“我去你城市玩你请客”“到时候你请我吃顿饭”。
-- 员工暗示客户“表示心意/小意思/特产”并指向自己收取：如“给我寄点特产/一点心意就行”“寄个东西给我”。
-
-**绝对合规内容（以下一律不违规）：**
-- 公司/员工**赠送客户**礼物、红包、礼品（收礼对象是客户而非员工）：“我们给您送个礼品/红包”“赠送您一个礼物”。
-- 客户单方面表达“想送礼/发红包/请吃饭”，员工明确拒绝且未引导继续：如“谢谢心意，不用/不能收”。
-- 纯粹的节日祝福、客套话，不指向收受礼品或请客回报的。
-
-**最终判决要点：**
-- 关键词 + 收礼对象明确为“员工/服务方自己” → **违规**（触发事件：收受客户礼品）。
-- 关键词仅用于“送给客户/公司活动赠品/员工明确拒绝” → **合规**。
-""",
-            """### 18. 夸大宣传策略重仓操作视为违规
-
-
-
-**核心逻辑：**
-禁止将策略/服务描述为“重仓操作”“敢上仓位/重仓参与”“一旦开仓就不是小打小闹”等夸大性表述，暗示客户应对该策略或机构票进行重仓投入，从而夸大策略份量、诱导客户大仓位跟投。
-
-**关键词与语境识别：**
-- 直接/强相关表述：一旦开仓就不是5%、10%小打小闹；对机构跟投策略足够有信心才敢上仓位/重仓参与；机构重仓王股、机构重仓股、带客户重仓参与、老师才会带客户重仓参与；私人定制学员开仓的机构重仓股；小仓位体验 vs 重仓参与 等对比性夸大。
-- 结合语境：在宣传“机构调研/机构王股/私人定制”时，强调“只有调研复核后才能重仓”“不是小打小闹”“重仓才有底气”等，即属夸大宣传策略重仓操作。
-
-**具体违规情形（满足任意一种即违规）：**
-- 明确描述策略为“重仓操作”或“一旦开仓就不是小比例、小打小闹”：如“一旦开仓不是5%、10%小打小闹”“真正知根知底实战操作的还要看…机构王股”“私人定制学员一旦决定开仓的机构重仓股…不是5%10%小打小闹”。
-- 以“敢上仓位/重仓参与”为卖点夸大策略：如“对机构跟投策略足够有信心，才敢上仓位/重仓参与”“只有私人定制调研复核后的机构重仓王股老师才会带客户重仓参与”。
-- 将“小仓位”与“重仓”对比，突出重仓才配得上该策略：如“小仓位体验一下…如果想重仓的学员…”“作业股只是初选池、开胃前菜，小仓位体验；重仓的学员…调研复核…才能重仓参与”。
-
-**绝对合规内容（以下一律不违规）：**
-- 仅客观陈述仓位、比例（如“建议小仓位试水”“注意仓位控制”），未夸大“该策略适合/要求重仓”的。
-- 未将策略与“重仓操作/敢上仓位”绑定的普通机构/调研话术。
-
-**最终判决要点：**
-- 关键词/语境 + 将策略或机构票与“重仓操作/上仓位/重仓参与/不是小打小闹”绑定 → **违规**（触发事件：夸大宣传策略重仓操作，仅 3.0 生效）。
-- 仅提及“重仓”“仓位”但未用于夸大策略或诱导大仓位跟投 → 结合全文判定，谨慎判违规。
-""",
-        ]
-        # 注意：您需要将完整的18条规则内容都放到上面的列表中
-
-    def _keyword_match_rules(self, text: str) -> List[Tuple[int, float]]:
-        """基于关键词匹配规则（备用检索方法）"""
+        """
+        从外部 Markdown 文件 `rules.md` 读取并返回 20 条完整规则内容。
+        这样你只需要编辑 Markdown 文件即可维护规则文本。
+        """
+        rules_path = os.path.join(os.path.dirname(__file__), "rules.md")
+        if not os.path.exists(rules_path):
+            raise FileNotFoundError(f"规则文件不存在: {rules_path}")
+
+        with open(rules_path, "r", encoding="utf-8") as f:
+            content = f.read()
+
+        # 按顶层规则标题 `### 1. ...` / `### 2. ...` 切分
+        lines = content.splitlines(keepends=True)
+        rule_blocks: List[str] = []
+        current: List[str] = []
+
+        for line in lines:
+            # 匹配形如 "### 1. 标题" 的规则标题；已开始收集内容时遇到新的标题则开始新规则
+            if re.match(r"^###\s+\d+\.", line) and current:
+                rule_blocks.append("".join(current).strip())
+                current = [line]
+            else:
+                current.append(line)
+
+        if current:
+            rule_blocks.append("".join(current).strip())
+
+        # 只保留以 "### 数字. 标题" 开头的规则块（排除文件开头的使用说明等）
+        rule_blocks = [blk for blk in rule_blocks if blk.strip() and re.match(r"^###\s+\d+\.", blk.lstrip())]
+
+        if len(rule_blocks) != 20:
+            raise ValueError(
+                f"解析到的规则数量为 {len(rule_blocks)}，预期为 20，请检查 rules.md 中顶层标题是否为 '### 序号. 标题' 格式。"
+            )
+
+        return rule_blocks
+
+    def _keyword_match_rules(self, text: str) -> List[Tuple[int, int, List[str]]]:
+        """Keyword matching fallback. Returns (rule_id, score, matched_keywords)."""
         if not isinstance(text, str):
             text = self._normalize_input_text(text)
         text_lower = (text or "").lower()
+        text_compact = self._normalize_case_text(text_lower)
         matches = []
-        
+
         for rule_id, keywords in self.rule_keywords.items():
             score = 0
             matched_keywords = []
-            
+
             for keyword in keywords:
-                if keyword in text_lower:
+                keyword_lower = (keyword or "").lower()
+                keyword_compact = self._normalize_case_text(keyword_lower)
+                # Normal match + compact match (space/punctuation split tolerant).
+                hit = (keyword_lower in text_lower) or (
+                    bool(keyword_compact) and keyword_compact in text_compact
+                )
+                if hit:
                     score += 1
                     matched_keywords.append(keyword)
-            
+
             if score > 0:
                 matches.append((rule_id, score, matched_keywords))
-        
-        # 按分数排序
+
         matches.sort(key=lambda x: x[1], reverse=True)
         return matches
 
-    def predict(self, text: str, product_type=None) -> Dict[str, Any]:
-        """预测违规情况 - 基于你给出代码的预测逻辑（18 个事件保留，仅过滤虚假宣传/对投研）
+    def predict(self, text: str, product_type=None, _is_direct_promise_retry: bool = False) -> Dict[str, Any]:
+        """预测违规情况（加减分 + 阈值）：按规则识别风险因子/保护因子并累加得到 risk_score，再按阈值判违规。
+
+        返回风险分、decision、confidence、触发事件及理由等；是否违规由 risk_score 与 violation_threshold 决定，非“命中即违规”。
 
         product_type: 产品类型。仅影响四个事件的生效范围：
         - "虚假宣传案例精选及人工推票" 仅在 product_type 为 1.0 时触发；
@@ -1195,61 +1426,149 @@ class ComplianceRAGEngine:
         - "对投研调研活动夸大宣传"、"夸大宣传策略重仓操作" 仅在 product_type 为 3.0 时触发；
         - 其他事件与未传 product_type 时均为全量检测。
         """
+        # 阈值可通过环境变量微调，方便线上校准
+        def _float_env(name: str, default: float) -> float:
+            v = os.getenv(name)
+            try:
+                return float(v) if v is not None and v.strip() != "" else default
+            except Exception:
+                return default
+
+        # 加减分制阈值：≥30 违规，15~30 人工复核，<15 合规；可通过环境变量覆盖
+        violation_threshold = _float_env("RISK_VIOLATION_THRESHOLD", 30.0)
+        review_threshold = _float_env("RISK_REVIEW_THRESHOLD", 15.0)
+        good_case_override_threshold = _float_env("GOOD_CASE_OVERRIDE_THRESHOLD", 0.82)
+        good_case_override_ratio = _float_env("GOOD_CASE_OVERRIDE_RATIO", 1.0)
+        good_case_force_discount = _float_env("GOOD_CASE_FORCE_DISCOUNT", 20.0)
+        bad_case_match_threshold = _float_env("BAD_CASE_MATCH_THRESHOLD", 0.82)
+        bad_case_force_score = _float_env("BAD_CASE_FORCE_SCORE", 35.0)
+        bad_case_bonus = _float_env("BAD_CASE_BONUS", 20.0)
+        calibration_fp_discount = _float_env("CALIBRATION_FP_DISCOUNT", 15.0)
+        calibration_fn_bonus = _float_env("CALIBRATION_FN_BONUS", 20.0)
+
         try:
             text = self._normalize_input_text(text)
-            # 1. 调用 LLM 获取原始响应（禁用 callbacks 避免控制台打印检索结果等中间步骤）
+            # 1. 调用 LLM 获取原始响应（预期为 JSON 字符串）
             raw_response = self.chain.invoke(text, config={"callbacks": []})
             if raw_response is None:
                 raw_response = ""
             raw_response = str(raw_response).strip()
-            
-            # 2. 基础解析变量初始化
-            lines = [line.strip() for line in raw_response.split('\n') if line.strip()]
-            violation = False
-            triggered_event_str = "无"
-            reason_raw = "未能解析模型响应"
-            
-            # 3. 逐行提取基础信息
-            try:
-                for line in lines:
-                    if line.startswith('是否违规：'):
-                        violation = "是" in line.split('：', 1)[-1]
-                    elif line.startswith('触发事件：'):
-                        triggered_event_str = line.split('：', 1)[-1].strip()
-                    elif line.startswith('理由：'):
-                        current_idx = lines.index(line)
-                        reason_parts = [line.split('：', 1)[-1].strip()]
-                        for next_line in lines[current_idx + 1:]:
-                            if not any(next_line.startswith(x) for x in ['是否违规：', '触发事件：', '理由：']):
-                                reason_parts.append(next_line)
-                            else:
-                                break
-                        reason_raw = ' '.join(reason_parts)
-                        break
-            except Exception as e:
-                reason_raw = f"解析关键行错误: {str(e)}"
-            
-            # 4. 拆分多个事件对应的理由
-            event_reasons = {}
-            if violation and triggered_event_str != "无":
-                pattern = r"\[(.*?)\][:：]\s*(.*?)(?=;|；|$|\[)"
-                matches = re.findall(pattern, reason_raw)
-                if matches:
-                    for evt_name, specific_reason in matches:
-                        clean_name = evt_name.strip()
-                        clean_reason = specific_reason.strip().rstrip(';').rstrip('；')
-                        event_reasons[clean_name] = clean_reason
-                else:
-                    events = [e.strip() for e in triggered_event_str.split(',') if e.strip()]
-                    for e in events:
-                        event_reasons[e] = reason_raw
 
-            # 5. 【product_type 过滤】虚假宣传(1.0)、冒用沈杨老师名义(2.0)、对投研/夸大策略重仓(3.0) 按产品类型过滤
+            # 2. 尝试解析 JSON（容错处理：截取最外层花括号）
+            parsed: Dict[str, Any] = {}
+            parse_error = None
+            try:
+                parsed = json.loads(raw_response)
+            except Exception as e1:
+                parse_error = str(e1)
+                try:
+                    start = raw_response.find("{")
+                    end = raw_response.rfind("}")
+                    if start != -1 and end != -1 and end > start:
+                        parsed = json.loads(raw_response[start : end + 1])
+                        parse_error = None
+                except Exception as e2:
+                    parse_error = f"{parse_error} | {str(e2)}"
+
+            if not isinstance(parsed, dict):
+                raise ValueError(f"无法解析模型 JSON 响应: {parse_error or '未知错误'}")
+
+            # 3. 读取基础字段（带默认值）
+            risk_score_raw = parsed.get("risk_score", 0)
+            try:
+                risk_score = float(risk_score_raw)
+            except Exception:
+                risk_score = 0.0
+            if risk_score < 0:
+                risk_score = 0.0
+            if risk_score > 100:
+                risk_score = 100.0
+
+            decision = str(parsed.get("decision", "") or "").strip().lower()
+            confidence_raw = parsed.get("confidence", 0.0)
+            try:
+                confidence = float(confidence_raw)
+            except Exception:
+                confidence = 0.0
+            if confidence < 0:
+                confidence = 0.0
+            if confidence > 1:
+                confidence = 1.0
+
+            risk_factors = parsed.get("risk_factors") or []
+            protective_factors = parsed.get("protective_factors") or []
+            summary_reason = parsed.get("summary_reason") or ""
+
+            # 4. 根据阈值与 decision 得到布尔违规结果
+            violation_by_score = risk_score >= violation_threshold
+            violation = decision == "violation" or violation_by_score
+
+            # 5. 从 risk_factors 中抽取触发事件及理由，并累计每个事件的风险得分
+            triggered_events: List[str] = []
+            event_reasons: Dict[str, str] = {}
+            event_scores: Dict[str, float] = {}
+
+            def _join_triggered_events() -> str:
+                return ", ".join(triggered_events) if triggered_events else "无"
+
+            def _decision_from_score() -> str:
+                return (
+                    "violation"
+                    if risk_score >= violation_threshold
+                    else ("review" if risk_score >= review_threshold else "compliant")
+                )
+
+            def _remove_event(rule_name: str) -> float:
+                nonlocal risk_score
+                removed_score = float(event_scores.pop(rule_name, 0.0) or 0.0)
+                triggered_events[:] = [e for e in triggered_events if e != rule_name]
+                event_reasons.pop(rule_name, None)
+                if removed_score > 0:
+                    risk_score = max(0.0, risk_score - removed_score)
+                return removed_score
+
+            def _upsert_event(rule_name: str, score: float, reason: str) -> None:
+                nonlocal risk_score
+                old_score = float(event_scores.get(rule_name, 0.0) or 0.0)
+                new_score = float(score)
+                if old_score > 0:
+                    risk_score = max(0.0, risk_score - old_score)
+                event_scores[rule_name] = new_score
+                risk_score = min(100.0, risk_score + new_score)
+                if rule_name not in triggered_events:
+                    triggered_events.append(rule_name)
+                if reason:
+                    event_reasons[rule_name] = reason
+
+            if isinstance(risk_factors, list):
+                for factor in risk_factors:
+                    if not isinstance(factor, dict):
+                        continue
+                    rule_name = str(factor.get("rule_name") or "").strip()
+                    if not rule_name:
+                        continue
+                    weight = factor.get("weight", 0)
+                    try:
+                        weight_val = float(weight)
+                    except Exception:
+                        weight_val = 0.0
+                    # 只把正向风险因子当作“触发事件”
+                    if weight_val <= 0:
+                        continue
+                    event_scores[rule_name] = event_scores.get(rule_name, 0.0) + weight_val
+                    sentence = str(factor.get("sentence") or "").strip()
+                    if rule_name not in triggered_events:
+                        triggered_events.append(rule_name)
+                    # 若该事件还没有理由，则记录一句代表性文本
+                    if rule_name not in event_reasons and sentence:
+                        event_reasons[rule_name] = sentence
+
+            triggered_event_str = ", ".join(triggered_events) if triggered_events else "无"
+
+            # 6. 按 product_type 过滤特定事件（保持与旧版逻辑一致）
             original_violation = violation
             original_triggered_event_str = triggered_event_str
-            original_reason_raw = reason_raw
             original_event_reasons = event_reasons.copy()
-            
             pt = product_type
             if pt is not None:
                 if pt in (1, "1", "1.0"):
@@ -1260,71 +1579,607 @@ class ComplianceRAGEngine:
                     pt = "3.0"
                 else:
                     pt = None
-            
-            if pt is not None and violation and triggered_event_str != "无":
-                normalized = re.sub(r'[，、;；\s]+', ',', triggered_event_str)
-                events = [e.strip() for e in normalized.split(',') if e.strip()]
-                filtered_events = []
+
+            if pt is not None and triggered_event_str != "无":
+                normalized = re.sub(r"[，、;；\s]+", ",", triggered_event_str)
+                events = [e.strip() for e in normalized.split(",") if e.strip()]
+                filtered_events: List[str] = []
                 for e in events:
-                    if "虚假宣传案例精选及人工推票" in e and pt != "1.0":
-                        continue
-                    if "对投研调研活动夸大宣传" in e and pt != "3.0":
-                        continue
-                    if "冒用沈杨老师名义" in e and pt != "2.0":
-                        continue
-                    if "夸大宣传策略重仓操作" in e and pt != "3.0":
-                        continue
-                    filtered_events.append(e)
+                    keep = True
+                    for gated_name, required_pt in self.PRODUCT_TYPE_GATED_EVENTS.items():
+                        if gated_name in e and pt != required_pt:
+                            keep = False
+                            break
+                    if keep:
+                        filtered_events.append(e)
                 filtered_events = list(dict.fromkeys(filtered_events))
-                filtered_event_reasons = {}
+
+                filtered_event_reasons: Dict[str, str] = {}
+                filtered_event_scores: Dict[str, float] = {}
                 for evt_name, evt_reason in event_reasons.items():
-                    should_keep = True
-                    if "虚假宣传案例精选及人工推票" in evt_name and pt != "1.0":
-                        should_keep = False
-                    elif "对投研调研活动夸大宣传" in evt_name and pt != "3.0":
-                        should_keep = False
-                    elif "冒用沈杨老师名义" in evt_name and pt != "2.0":
-                        should_keep = False
-                    elif "夸大宣传策略重仓操作" in evt_name and pt != "3.0":
-                        should_keep = False
-                    if should_keep:
+                    keep = True
+                    for gated_name, required_pt in self.PRODUCT_TYPE_GATED_EVENTS.items():
+                        if gated_name in evt_name and pt != required_pt:
+                            keep = False
+                            break
+                    if keep:
                         filtered_event_reasons[evt_name] = evt_reason
+                        if evt_name in event_scores:
+                            filtered_event_scores[evt_name] = event_scores[evt_name]
+
                 triggered_event_str = ", ".join(filtered_events) if filtered_events else "无"
-                violation = bool(filtered_events)
-                if filtered_event_reasons:
-                    new_reason_parts = [f"[{evt_name}]:{filtered_event_reasons[evt_name]}" for evt_name in filtered_events if evt_name in filtered_event_reasons]
-                    reason_raw = "；".join(new_reason_parts)
-                else:
-                    reason_raw = "所有事件均根据产品类型过滤"
                 event_reasons = filtered_event_reasons
+                event_scores = filtered_event_scores
+
+                # 若按产品类型过滤后没有剩余高风险事件，则可以视情况下调违规结论
                 if not filtered_events:
-                    violation = False
-                    triggered_event_str = "无"
-                    reason_raw = "所有表述均为合规描述"
-            
+                    # 若 risk_score 主要来源于被过滤事件，理论上应降低违规等级。
+                    # 为了安全，这里仅在 risk_score 不高时（小于 violation 阈值）自动降为合规。
+                    if risk_score < violation_threshold:
+                        violation = False
+
+            # 6.4 E13 最小化后处理：只校正“违规指导”本身，不影响其他事件
+            e13_name = self._get_rule_name_by_id(13)
+            if e13_name:
+                e13_ctx = self._analyze_e13_context(text, summary_reason)
+                summary_supports_e13 = bool(e13_ctx["summary_supports_e13"])
+                summary_negates_e13 = bool(e13_ctx["summary_negates_e13"])
+                rule_supports_e13 = bool(e13_ctx["rule_supports_e13"])
+                should_block_e13 = bool(e13_ctx["should_block_e13"])
+
+                if e13_name in event_scores:
+                    # 先尊重大模型命中结果，再用规则只校正 E13 自身，防止误判。
+                    if should_block_e13:
+                        _remove_event(e13_name)
+                        triggered_event_str = _join_triggered_events()
+                        decision = _decision_from_score()
+                        violation = decision == "violation"
+                    elif summary_negates_e13 and not rule_supports_e13:
+                        _remove_event(e13_name)
+                        triggered_event_str = _join_triggered_events()
+                        decision = _decision_from_score()
+                        violation = decision == "violation"
+                    elif summary_supports_e13:
+                        _upsert_event(e13_name, event_scores.get(e13_name, 60.0) or 60.0, str(summary_reason).strip())
+                        triggered_event_str = _join_triggered_events()
+                        decision = _decision_from_score()
+                        violation = decision == "violation"
+                else:
+                    # E13 规则只做后置过滤，不再承担补漏判。
+                    pass
+
+            # 6.4 bad case 强匹配触发：支持“未触发也可因 bad case 命中触发”
+            bad_case_hits: List[Dict[str, Any]] = []
+            if getattr(self, "_bad_case_embeddings_by_rule", None):
+                try:
+                    text_embedding = self.embeddings.embed_query(text)
+                except Exception:
+                    text_embedding = []
+
+                if text_embedding:
+                    candidate_rule_ids = self._get_candidate_rule_ids(text)
+                    # 对字面直匹配，放宽到全量 bad case 规则，避免候选召回漏掉该规则。
+                    literal_hit_rule_ids = set()
+                    for rid_all, bad_texts in (self._bad_case_texts_by_rule or {}).items():
+                        for bad_text in bad_texts:
+                            if self._literal_case_match(text, bad_text):
+                                literal_hit_rule_ids.add(rid_all)
+                                break
+                    rule_ids_for_bad_match = list(dict.fromkeys(candidate_rule_ids + list(literal_hit_rule_ids)))
+                    for rid in rule_ids_for_bad_match:
+                        best_sim, best_bad_case = self._best_bad_case_match(text_embedding, rid, text)
+                        # 字面直匹配优先：命中则按 sim=1.0 处理，避免相似度阈值漏掉近似同句。
+                        for bad_text in (self._bad_case_texts_by_rule.get(rid) or []):
+                            if self._literal_case_match(text, bad_text):
+                                best_sim = 1.0
+                                best_bad_case = bad_text
+                                break
+                        if best_sim < bad_case_match_threshold:
+                            continue
+                        rule_name = self._get_rule_name_by_id(rid)
+                        if self._has_hard_risk_pattern(text, rid):
+                            delta = max(0.0, bad_case_bonus)
+                        elif rule_name in event_scores:
+                            delta = max(0.0, bad_case_bonus)
+                        else:
+                            delta = max(0.0, bad_case_force_score)
+                        if delta <= 0:
+                            continue
+
+                        risk_score = min(100.0, risk_score + delta)
+                        event_scores[rule_name] = event_scores.get(rule_name, 0.0) + delta
+                        if rule_name not in triggered_events:
+                            triggered_events.append(rule_name)
+                        if rule_name not in event_reasons:
+                            event_reasons[rule_name] = best_bad_case or "命中 BAD case 强匹配"
+                        bad_case_hits.append(
+                            {
+                                "rule_id": rid,
+                                "rule_name": rule_name,
+                                "bad_case_score": round(best_sim, 4),
+                                "matched_bad_case": best_bad_case,
+                                "bonus": round(delta, 2),
+                            }
+                        )
+                    triggered_event_str = ", ".join(triggered_events) if triggered_events else "无"
+            else:
+                bad_case_hits = []
+
+            # 6.5 good case 强匹配覆盖：对命中的事件做减分（保留硬风险兜底）
+            good_case_overrides: List[Dict[str, Any]] = []
+            override_total = 0.0
+            if getattr(self, "_good_case_embeddings_by_rule", None):
+                if 'text_embedding' not in locals():
+                    try:
+                        text_embedding = self.embeddings.embed_query(text)
+                    except Exception:
+                        text_embedding = []
+
+                # 与 bad case 一致：字面直匹配可以绕过候选召回限制。
+                literal_good_hit_rule_ids = set()
+                for rid_all, good_texts in (self._good_case_texts_by_rule or {}).items():
+                    for good_text in good_texts:
+                        if self._literal_case_match(text, good_text):
+                            literal_good_hit_rule_ids.add(rid_all)
+                            break
+                event_rule_ids = [self._rule_name_to_id.get(name) for name in event_scores.keys()]
+                event_rule_ids = [rid for rid in event_rule_ids if rid is not None]
+                rule_ids_for_good_match = list(dict.fromkeys(event_rule_ids + list(literal_good_hit_rule_ids)))
+
+                removed_events = set()
+                for rid in rule_ids_for_good_match:
+                    evt_name = self._get_rule_name_by_id(rid)
+                    evt_score = float(event_scores.get(evt_name, 0.0) or 0.0)
+                    if self._has_hard_risk_pattern(text, rid):
+                        continue
+
+                    best_sim, best_good_case = self._best_good_case_match(text_embedding, rid, text)
+                    # 字面直匹配优先
+                    for good_text in (self._good_case_texts_by_rule.get(rid) or []):
+                        if self._literal_case_match(text, good_text):
+                            best_sim = 1.0
+                            best_good_case = good_text
+                            break
+                    if best_sim < good_case_override_threshold:
+                        continue
+
+                    if evt_score > 0:
+                        discount = min(evt_score, max(0.0, evt_score * good_case_override_ratio))
+                    else:
+                        discount = min(max(0.0, good_case_force_discount), risk_score)
+                    if discount <= 0:
+                        continue
+
+                    override_total += discount
+                    if evt_name in event_scores:
+                        removed_events.add(evt_name)
+                    good_case_overrides.append(
+                        {
+                            "rule_id": rid,
+                            "rule_name": evt_name,
+                            "good_case_score": round(best_sim, 4),
+                            "matched_good_case": best_good_case,
+                            "discount": round(discount, 2),
+                        }
+                    )
+
+                if removed_events:
+                    risk_score = max(0.0, risk_score - override_total)
+                    triggered_events = [e for e in triggered_events if e not in removed_events]
+                    triggered_event_str = ", ".join(triggered_events) if triggered_events else "无"
+                    event_reasons = {k: v for k, v in event_reasons.items() if k not in removed_events}
+                    event_scores = {k: v for k, v in event_scores.items() if k not in removed_events}
+
+            # 6.6 易错说明校准：易误判减分、易漏判加分（按短语命中）
+            calibration_hits: List[Dict[str, Any]] = []
+            text_norm = text or ""
+            structured_calibrated_rule_ids: set[int] = set()
+
+            # 先执行结构化校准规则（优先级高于文本短语校准）
+            for rid, rules in (getattr(self, "_structured_calibration_rules", {}) or {}).items():
+                if not isinstance(rules, list):
+                    continue
+                rule_name = self._get_rule_name_by_id(rid)
+                for rule_obj in rules:
+                    if not isinstance(rule_obj, dict):
+                        continue
+                    if not self._matches_structured_rule(text_norm, rule_obj):
+                        continue
+                    rule_type = str(rule_obj.get("type", "") or "").strip().lower()
+                    weight = rule_obj.get("weight")
+                    try:
+                        weight_val = float(weight) if weight is not None else None
+                    except Exception:
+                        weight_val = None
+                    note = str(rule_obj.get("note", "") or "").strip()
+
+                    if (
+                        rule_type == "false_positive"
+                        and rule_name in event_scores
+                        and not self._has_hard_risk_pattern(text_norm, rid)
+                    ):
+                        delta_base = calibration_fp_discount if weight_val is None else abs(weight_val)
+                        current_evt_score = event_scores.get(rule_name, delta_base)
+                        delta = min(max(0.0, delta_base), current_evt_score)
+                        if delta > 0:
+                            risk_score = max(0.0, risk_score - delta)
+                            if rule_name in event_scores:
+                                new_score = max(0.0, event_scores.get(rule_name, 0.0) - delta)
+                                if new_score <= 0.0:
+                                    event_scores.pop(rule_name, None)
+                                    event_reasons.pop(rule_name, None)
+                                    triggered_events = [e for e in triggered_events if e != rule_name]
+                                else:
+                                    event_scores[rule_name] = new_score
+                            calibration_hits.append(
+                                {
+                                    "rule_id": rid,
+                                    "rule_name": rule_name,
+                                    "type": "false_positive",
+                                    "matched_terms": [note] if note else ["structured_rule"],
+                                    "delta": round(-delta, 2),
+                                }
+                            )
+                            structured_calibrated_rule_ids.add(rid)
+
+                    elif rule_type == "false_negative":
+                        delta_base = calibration_fn_bonus if weight_val is None else abs(weight_val)
+                        delta = max(0.0, delta_base)
+                        if delta > 0:
+                            risk_score = min(100.0, risk_score + delta)
+                            event_scores[rule_name] = event_scores.get(rule_name, 0.0) + delta
+                            if rule_name not in triggered_events:
+                                triggered_events.append(rule_name)
+                            if rule_name not in event_reasons:
+                                event_reasons[rule_name] = note or "命中结构化易漏判校准"
+                            calibration_hits.append(
+                                {
+                                    "rule_id": rid,
+                                    "rule_name": rule_name,
+                                    "type": "false_negative",
+                                    "matched_terms": [note] if note else ["structured_rule"],
+                                    "delta": round(delta, 2),
+                                }
+                            )
+                            structured_calibrated_rule_ids.add(rid)
+
+            # 再执行旧版“易错说明短语”校准（对已走结构化规则的 rule_id 不重复执行）
+            for rid, hint_map in (getattr(self, "_calibration_hints", {}) or {}).items():
+                if rid in structured_calibrated_rule_ids:
+                    continue
+                rule_name = self._get_rule_name_by_id(rid)
+                fp_terms = hint_map.get("false_positive") or []
+                fn_terms = hint_map.get("false_negative") or []
+                matched_fp = [t for t in fp_terms if t and t in text_norm]
+                matched_fn = [t for t in fn_terms if t and t in text_norm]
+
+                # 易误判：命中且无硬风险时减分
+                if matched_fp and rule_name in event_scores and not self._has_hard_risk_pattern(text_norm, rid):
+                    delta = min(max(0.0, calibration_fp_discount), event_scores.get(rule_name, 0.0) if rule_name in event_scores else calibration_fp_discount)
+                    if delta > 0:
+                        risk_score = max(0.0, risk_score - delta)
+                        if rule_name in event_scores:
+                            new_score = max(0.0, event_scores.get(rule_name, 0.0) - delta)
+                            if new_score <= 0.0:
+                                event_scores.pop(rule_name, None)
+                                event_reasons.pop(rule_name, None)
+                                triggered_events = [e for e in triggered_events if e != rule_name]
+                            else:
+                                event_scores[rule_name] = new_score
+                        calibration_hits.append(
+                            {
+                                "rule_id": rid,
+                                "rule_name": rule_name,
+                                "type": "false_positive",
+                                "matched_terms": matched_fp,
+                                "delta": round(-delta, 2),
+                            }
+                        )
+
+                # 易漏判：命中时加分
+                if matched_fn:
+                    delta = max(0.0, calibration_fn_bonus)
+                    if delta > 0:
+                        risk_score = min(100.0, risk_score + delta)
+                        event_scores[rule_name] = event_scores.get(rule_name, 0.0) + delta
+                        if rule_name not in triggered_events:
+                            triggered_events.append(rule_name)
+                        if rule_name not in event_reasons:
+                            event_reasons[rule_name] = "命中易漏判校准短语"
+                        calibration_hits.append(
+                            {
+                                "rule_id": rid,
+                                "rule_name": rule_name,
+                                "type": "false_negative",
+                                "matched_terms": matched_fn,
+                                "delta": round(delta, 2),
+                            }
+                        )
+            triggered_event_str = ", ".join(triggered_events) if triggered_events else "无"
+
+            # 如果没有任何触发事件，但 risk_score 仍然很高，reason 使用 summary_reason 兜底
+            # 6.65 E01 后置过滤：只做“明确反向/明确保护”的误删清理，不做补召回，不影响其他事件
+            e01_name = self._get_rule_name_by_id(1)
+            if e01_name:
+                e01_ctx = self._analyze_e01_context(text_norm, summary_reason)
+                summary_supports_e01 = bool(e01_ctx["summary_supports_e01"])
+                summary_negates_e01 = bool(e01_ctx["summary_negates_e01"])
+                has_strong_protection = bool(e01_ctx["has_strong_protection"])
+                should_block_e01 = summary_negates_e01 or has_strong_protection
+
+                if e01_name in event_scores and should_block_e01:
+                    _remove_event(e01_name)
+                    triggered_event_str = _join_triggered_events()
+
+            # 6.7 conflict resolution: in risk-assessment context, prefer E08 over E13
+            e08_name = self._get_rule_name_by_id(8)
+            e13_name = self._get_rule_name_by_id(13)
+            if (
+                self._is_risk_assessment_context(text_norm)
+                and self._has_assessment_steering(text_norm)
+                and e13_name in event_scores
+            ):
+                moved_score = float(event_scores.get(e13_name, 0.0) or 0.0)
+                event_scores.pop(e13_name, None)
+                triggered_events = [e for e in triggered_events if e != e13_name]
+                event_reasons.pop(e13_name, None)
+
+                if moved_score > 0:
+                    event_scores[e08_name] = event_scores.get(e08_name, 0.0) + moved_score
+                    if e08_name not in triggered_events:
+                        triggered_events.append(e08_name)
+                    if e08_name not in event_reasons:
+                        event_reasons[e08_name] = "在风险测评填写中存在替选答案/引导作答，干扰风险测评独立性。"
+
+                bad_case_hits = [h for h in bad_case_hits if str(h.get("rule_name", "")) != e13_name]
+                calibration_hits = [h for h in calibration_hits if str(h.get("rule_name", "")) != e13_name]
+                good_case_overrides = [h for h in good_case_overrides if str(h.get("rule_name", "")) != e13_name]
+                triggered_event_str = ", ".join(triggered_events) if triggered_events else "无"
+
+            # 6.75 conflict resolution: in risk-assessment context, E07 should not stand;
+            # if there is explicit steering, map to E08, otherwise clear E07.
+            e07_name = self._get_rule_name_by_id(7)
+            if self._is_risk_assessment_context(text_norm) and e07_name in event_scores:
+                moved_score = float(event_scores.get(e07_name, 0.0) or 0.0)
+                event_scores.pop(e07_name, None)
+                triggered_events = [e for e in triggered_events if e != e07_name]
+                event_reasons.pop(e07_name, None)
+
+                if moved_score > 0 and self._has_assessment_steering(text_norm):
+                    event_scores[e08_name] = event_scores.get(e08_name, 0.0) + moved_score
+                    if e08_name not in triggered_events:
+                        triggered_events.append(e08_name)
+                    if e08_name not in event_reasons:
+                        event_reasons[e08_name] = "在风测场景中存在明确作答干预，按E08处理。"
+                else:
+                    risk_score = max(0.0, risk_score - moved_score)
+
+                bad_case_hits = [h for h in bad_case_hits if str(h.get("rule_name", "")) != e07_name]
+                calibration_hits = [h for h in calibration_hits if str(h.get("rule_name", "")) != e07_name]
+                good_case_overrides = [h for h in good_case_overrides if str(h.get("rule_name", "")) != e07_name]
+                triggered_event_str = ", ".join(triggered_events) if triggered_events else "无"
+
+            # 6.8 official addwx whitelist: do not treat official abctougu addwx links as E07 abnormal account opening
+            if self._has_official_abctougu_addwx_link(text_norm) and e07_name in event_scores:
+                removed_score = float(event_scores.get(e07_name, 0.0) or 0.0)
+                event_scores.pop(e07_name, None)
+                triggered_events = [e for e in triggered_events if e != e07_name]
+                event_reasons.pop(e07_name, None)
+                if removed_score > 0:
+                    risk_score = max(0.0, risk_score - removed_score)
+                bad_case_hits = [h for h in bad_case_hits if str(h.get("rule_name", "")) != e07_name]
+                calibration_hits = [h for h in calibration_hits if str(h.get("rule_name", "")) != e07_name]
+                good_case_overrides = [h for h in good_case_overrides if str(h.get("rule_name", "")) != e07_name]
+                triggered_event_str = ", ".join(triggered_events) if triggered_events else "无"
+
+            # 6.81 service/payment onboarding whitelist: do not treat payment QR / onboarding flows as E07.
+            if self._has_service_payment_onboarding(text_norm) and e07_name in event_scores:
+                removed_score = float(event_scores.get(e07_name, 0.0) or 0.0)
+                event_scores.pop(e07_name, None)
+                triggered_events = [e for e in triggered_events if e != e07_name]
+                event_reasons.pop(e07_name, None)
+                if removed_score > 0:
+                    risk_score = max(0.0, risk_score - removed_score)
+                bad_case_hits = [h for h in bad_case_hits if str(h.get("rule_name", "")) != e07_name]
+                calibration_hits = [h for h in calibration_hits if str(h.get("rule_name", "")) != e07_name]
+                good_case_overrides = [h for h in good_case_overrides if str(h.get("rule_name", "")) != e07_name]
+                triggered_event_str = ", ".join(triggered_events) if triggered_events else "无"
+
+            # 6.9 E13 final safety net:
+            # if the LLM summary has already clearly concluded "违规指导",
+            # restore only E13 itself unless the text is clearly a service/product introduction.
+            if e13_name:
+                e13_ctx = locals().get("e13_ctx") or self._analyze_e13_context(text_norm, summary_reason)
+                summary_supports_e13_final = bool(e13_ctx["summary_supports_e13"])
+                summary_negates_e13_final = bool(e13_ctx["summary_negates_e13"])
+                late_rule_supports_e13 = bool(e13_ctx["rule_supports_e13"])
+                late_loose_rule_supports_e13 = bool(e13_ctx.get("loose_rule_supports_e13"))
+                late_should_block_e13 = bool(e13_ctx["should_block_e13"])
+                late_has_target = bool(e13_ctx.get("has_target"))
+                late_has_action = bool(e13_ctx.get("has_action")) or any(
+                    keyword in text_norm for keyword in ["买入", "卖出", "加仓", "减仓", "持有", "清仓", "止损", "止盈", "试错", "跟进"]
+                )
+                late_has_condition = bool(e13_ctx.get("has_condition")) or any(
+                    keyword in text_norm for keyword in ["跌破", "突破", "回踩", "站稳", "一半", "半仓", "轻仓", "重仓", "元", "块"]
+                )
+                late_summary_explicit_support = summary_supports_e13_final or (
+                    not summary_negates_e13_final
+                    and "违规指导" in summary_reason
+                    and any(token in summary_reason for token in ["构成", "符合规则 13", "符合规则13", "高风险判定标准"])
+                )
+                late_contains_service_intro = bool(e13_ctx.get("contains_service_intro"))
+                late_service_phrase_hit = any(
+                    keyword in text_norm for keyword in self._get_e13_service_intro_keywords()
+)
+
+                # Minimal E13 consistency correction:
+                # only when the LLM summary explicitly supports E13 and the structured E13 rule
+                # also strongly supports it, but E13 is still missing from final events.
+                if (
+                    e13_name not in event_scores
+                    and late_summary_explicit_support
+                    and not late_contains_service_intro
+                    and not late_service_phrase_hit
+                    and (
+                        late_rule_supports_e13
+                        or late_loose_rule_supports_e13
+                        or sum([late_has_target, late_has_action, late_has_condition]) >= 2
+                    )
+                    and not (
+                        late_should_block_e13
+                        and not late_loose_rule_supports_e13
+                        and sum([late_has_target, late_has_action, late_has_condition]) < 2
+                    )
+                ):
+                    _upsert_event(e13_name, 60.0, str(summary_reason).strip())
+                    triggered_event_str = _join_triggered_events()
+
+                # Final E13 cleanup for multi-event scenarios:
+                # if E13 is still present but the text is actually a service intro / capability sale /
+                # or the model explicitly negates E13 without hard rule support, remove only E13.
+                late_core_signal_support = sum([late_has_target, late_has_action, late_has_condition]) >= 2
+                if e13_name in event_scores and (
+                    (
+                        (late_should_block_e13 or late_service_phrase_hit)
+                        and not late_loose_rule_supports_e13
+                        and not late_core_signal_support
+                    )
+                    or (summary_negates_e13_final and not late_rule_supports_e13 and not late_core_signal_support)
+                ):
+                    _remove_event(e13_name)
+                    triggered_event_str = _join_triggered_events()
+            if not event_reasons and summary_reason:
+                event_reasons = {"综合说明": str(summary_reason)}
+
+            # 7. 为每个事件理由增加事件得分前缀（若有），并在整体理由中附上总分
+            formatted_event_reasons: Dict[str, str] = {}
+            for evt_name, evt_reason in event_reasons.items():
+                prefix = ""
+                if evt_name in event_scores:
+                    prefix = f"[该事件得分约 {event_scores[evt_name]:.1f}] "
+                formatted_event_reasons[evt_name] = f"{prefix}{evt_reason}"
+
+            final_decision = (
+                "violation"
+                if risk_score >= violation_threshold
+                else ("review" if risk_score >= review_threshold else "compliant")
+            )
+            violation = final_decision == "violation"
+            override_reason_suffix = ""
+            if good_case_overrides:
+                override_parts: List[str] = []
+                for item in good_case_overrides:
+                    rule_name = str(item.get("rule_name", "") or "")
+                    matched_good_case = str(item.get("matched_good_case", "") or "")
+                    sim = item.get("good_case_score", 0.0)
+                    discount = item.get("discount", 0.0)
+                    try:
+                        sim_val = float(sim)
+                    except Exception:
+                        sim_val = 0.0
+                    try:
+                        discount_val = float(discount)
+                    except Exception:
+                        discount_val = 0.0
+                    override_parts.append(
+                        f"{rule_name} 命中GOOD案例“{matched_good_case}”(sim={sim_val:.2f}, 抵扣={discount_val:.1f})"
+                    )
+                override_reason_suffix = "；GOOD案例覆盖：" + "；".join(override_parts)
+            bad_case_reason_suffix = "；BAD案例触发：无"
+            if bad_case_hits:
+                bad_parts: List[str] = []
+                for item in bad_case_hits:
+                    rule_name = str(item.get("rule_name", "") or "")
+                    matched_bad_case = str(item.get("matched_bad_case", "") or "")
+                    sim = item.get("bad_case_score", 0.0)
+                    bonus = item.get("bonus", 0.0)
+                    try:
+                        sim_val = float(sim)
+                    except Exception:
+                        sim_val = 0.0
+                    try:
+                        bonus_val = float(bonus)
+                    except Exception:
+                        bonus_val = 0.0
+                    bad_parts.append(
+                        f"{rule_name} 命中BAD案例“{matched_bad_case}”(sim={sim_val:.2f}, 加分={bonus_val:.1f})"
+                    )
+                bad_case_reason_suffix = "；BAD案例触发：" + "；".join(bad_parts)
+            calibration_reason_suffix = "；易错说明校准：无"
+            if calibration_hits:
+                cal_parts: List[str] = []
+                for item in calibration_hits:
+                    rname = str(item.get("rule_name", "") or "")
+                    ctype = str(item.get("type", "") or "")
+                    terms = item.get("matched_terms", []) or []
+                    delta = item.get("delta", 0.0)
+                    ctype_text = "易误判校准" if ctype == "false_positive" else "易漏判校准"
+                    cal_parts.append(f"{rname} {ctype_text} 命中{terms}({delta:+.1f})")
+                calibration_reason_suffix = "；易错说明校准：" + "；".join(cal_parts)
+            if not good_case_overrides:
+                override_reason_suffix = "；GOOD案例覆盖：无"
+            if summary_reason:
+                reason_text = f"整体风险分 {risk_score:.1f}，决策 {final_decision}。{summary_reason}{bad_case_reason_suffix}{override_reason_suffix}{calibration_reason_suffix}"
+            else:
+                reason_text = f"整体风险分 {risk_score:.1f}，决策 {final_decision}。模型未给出详细说明{bad_case_reason_suffix}{override_reason_suffix}{calibration_reason_suffix}"
+
+            e01_name = self._get_rule_name_by_id(1)
+            should_rerun_direct_promise = (
+                not _is_direct_promise_retry
+                and bool(e01_name)
+                and e01_name in event_scores
+            )
+            if should_rerun_direct_promise:
+                return self.predict(
+                    text,
+                    product_type=product_type,
+                    _is_direct_promise_retry=True,
+                )
+
+            # 8. 将 raw_response 规范化为三行文本输出，方便外部系统直接使用
+            line_violation = f"是否违规：{'是' if violation else '否'}"
+            line_events = f"触发事件：{triggered_event_str if triggered_event_str else '无'}"
+            line_reason = f"理由：{reason_text}"
+            raw_response = "\n".join([line_violation, line_events, line_reason])
+
             return {
                 "raw_response": raw_response,
                 "violation": violation,
-                "triggered_event": triggered_event_str,
-                "reason": reason_raw,
-                "event_reasons": event_reasons,
-                # 调试信息，可选
+                "triggered_event": triggered_event_str if violation else ("无" if triggered_event_str == "无" else triggered_event_str),
+                "reason": reason_text,
+                "event_reasons": formatted_event_reasons,
+                # 新增评分相关字段，供上层使用
+                "risk_score": risk_score,
+                "decision": final_decision,
+                "confidence": confidence,
+                "risk_factors": risk_factors,
+                "protective_factors": protective_factors,
+                "bad_case_hits": bad_case_hits,
+                "good_case_overrides": good_case_overrides,
+                "calibration_hits": calibration_hits,
                 "_debug": {
+                    "violation_threshold": violation_threshold,
+                    "review_threshold": review_threshold,
                     "original_violation": original_violation,
                     "original_triggered_event": original_triggered_event_str,
-                    "original_reason": original_reason_raw,
+                    "original_event_reasons": original_event_reasons,
                     "product_type": product_type,
-                    "normalized_product_type": pt
-                } if product_type is not None else None
+                    "normalized_product_type": pt,
+                } if product_type is not None else None,
             }
-            
+
         except Exception as e:
             return {
                 "raw_response": f"系统错误: {str(e)}",
                 "violation": False,
                 "triggered_event": "系统错误",
                 "reason": str(e),
-                "event_reasons": {}
+                "event_reasons": {},
+                "risk_score": 0.0,
+                "decision": "compliant",
+                "confidence": 0.0,
+                "risk_factors": [],
+                "protective_factors": [],
             }
 
 
