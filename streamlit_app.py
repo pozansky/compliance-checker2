@@ -1,5 +1,6 @@
 import os
 import sys
+import glob
 from typing import Optional
 
 import streamlit as st
@@ -13,12 +14,30 @@ def _ensure_project_on_syspath() -> None:
 
 
 @st.cache_resource
-def _get_engine():
+def _get_engine(_cache_sig: str):
     _ensure_project_on_syspath()
     # Import here so Streamlit caching works cleanly
-    from rag_engine import ComplianceRAGEngine
+    from src.rag_engine import ComplianceRAGEngine
 
     return ComplianceRAGEngine()
+
+
+def _build_cache_signature() -> str:
+    """使用 rules/cases 文件 mtime 生成缓存签名，文件变更后自动重建引擎。"""
+    root_dir = os.path.dirname(os.path.abspath(__file__))
+    src_dir = os.path.join(root_dir, "src")
+    targets = [
+        os.path.join(src_dir, "rules.md"),
+        os.path.join(src_dir, "rag_engine.py"),
+    ]
+    targets.extend(glob.glob(os.path.join(src_dir, "cases", "E??_*.md")))
+    sig_items = []
+    for path in sorted(targets):
+        try:
+            sig_items.append(f"{path}:{os.path.getmtime(path)}")
+        except OSError:
+            continue
+    return "|".join(sig_items)
 
 
 def _normalize_product_type(pt_label: str) -> Optional[str]:
@@ -30,8 +49,8 @@ def _normalize_product_type(pt_label: str) -> Optional[str]:
 def main() -> None:
     st.set_page_config(page_title="合规检测系统", page_icon="🔍", layout="wide")
 
-    st.title("🔍 合规检测系统（统一使用 rag_engine.py）")
-    st.caption("此页面只负责界面展示，所有规则与判断逻辑都在 `rag_engine.py` 维护。")
+    st.title("🔍 合规检测系统（统一使用 src/rag_engine.py）")
+    st.caption("此页面只负责界面展示，所有规则与判断逻辑都在 `src/rag_engine.py` 维护。")
 
     with st.sidebar:
         st.header("配置")
@@ -78,7 +97,7 @@ def main() -> None:
                 st.warning("请输入聊天内容后再检测。")
                 return
 
-            engine = _get_engine()
+            engine = _get_engine(_build_cache_signature())
             pt = _normalize_product_type(product_type_label)
 
             with st.spinner("分析中..."):
@@ -88,15 +107,19 @@ def main() -> None:
             triggered_event = str(result.get("triggered_event", "无") or "无")
             reason = str(result.get("reason", "") or "")
             raw_response = str(result.get("raw_response", "") or "")
+            risk_score = float(result.get("risk_score", 0.0) or 0.0)
+            decision = str(result.get("decision", "") or "").lower()
+            confidence = float(result.get("confidence", 0.0) or 0.0)
 
             # 顶部状态条
             if violation:
-                st.error("判定：违规", icon="⛔")
+                st.error(f"判定：违规（risk_score={risk_score:.1f}, decision={decision}, confidence={confidence:.2f}）", icon="⛔")
             else:
-                st.success("判定：合规", icon="✅")
+                st.success(f"判定：合规（risk_score={risk_score:.1f}, decision={decision}, confidence={confidence:.2f}）", icon="✅")
 
             # 关键信息
             st.markdown(f"**触发事件：** {triggered_event}")
+            st.markdown(f"**风险分数：** {risk_score:.1f}")
 
             tabs = st.tabs(["理由", "原始输出", "调试"])
 
@@ -124,3 +147,4 @@ def main() -> None:
 if __name__ == "__main__":
     main()
 
+  
